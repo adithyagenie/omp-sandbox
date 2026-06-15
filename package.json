@@ -1,0 +1,15 @@
+{
+  "name": "pi-sandbox-omp",
+  "version": "0.1.0",
+  "description": "OS-level sandboxing for omp (oh-my-pi) with interactive permission prompts. Functional rewrite of carderne/pi-sandbox for the @oh-my-pi runtime.",
+  "type": "module",
+  "license": "MIT",
+  "omp": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "@carderne/sandbox-runtime": "^0.0.49"
+  }
+}
