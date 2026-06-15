@@ -129,18 +129,49 @@ function loadConfig(cwd: string): SandboxConfig {
     }
   }
 
-  return deepMerge(deepMerge(DEFAULT_CONFIG, globalConfig), projectConfig);
+  return deepMerge(deepMerge(DEFAULT_CONFIG, globalConfig), projectConfig, true);
 }
 
-function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>): SandboxConfig {
+/** Union two path/domain lists, preserving order and dropping duplicates. */
+function unionPaths(a?: string[], b?: string[]): string[] {
+  return [...new Set([...(a ?? []), ...(b ?? [])])];
+}
+
+function deepMerge(
+  base: SandboxConfig,
+  overrides: Partial<SandboxConfig>,
+  additive = false,
+): SandboxConfig {
   const result: SandboxConfig = { ...base };
 
   if (overrides.enabled !== undefined) result.enabled = overrides.enabled;
   if (overrides.network) {
-    result.network = { ...base.network, ...overrides.network };
+    // Allow-lists accumulate across layers (a later scope grants more); deny
+    // lists and scalars still replace so a tighter scope can override defaults.
+    result.network = {
+      ...base.network,
+      ...overrides.network,
+      ...(additive
+        ? {
+            allowedDomains: unionPaths(
+              base.network?.allowedDomains,
+              overrides.network.allowedDomains,
+            ),
+          }
+        : {}),
+    };
   }
   if (overrides.filesystem) {
-    result.filesystem = { ...base.filesystem, ...overrides.filesystem };
+    result.filesystem = {
+      ...base.filesystem,
+      ...overrides.filesystem,
+      ...(additive
+        ? {
+            allowRead: unionPaths(base.filesystem?.allowRead, overrides.filesystem.allowRead),
+            allowWrite: unionPaths(base.filesystem?.allowWrite, overrides.filesystem.allowWrite),
+          }
+        : {}),
+    };
   }
 
   const extOverrides = overrides as {
@@ -342,11 +373,7 @@ function addDomainToConfig(configPath: string, domain: string): void {
   const config = readOrEmptyConfig(configPath);
   const existing = config.network?.allowedDomains ?? [];
   if (!existing.includes(domain)) {
-    config.network = {
-      ...config.network,
-      allowedDomains: [...existing, domain],
-      deniedDomains: config.network?.deniedDomains ?? [],
-    };
+    config.network = { ...config.network, allowedDomains: [...existing, domain] };
     writeConfigFile(configPath, config);
   }
 }
@@ -355,13 +382,7 @@ function addReadPathToConfig(configPath: string, pathToAdd: string): void {
   const config = readOrEmptyConfig(configPath);
   const existing = config.filesystem?.allowRead ?? [];
   if (!existing.includes(pathToAdd)) {
-    config.filesystem = {
-      ...config.filesystem,
-      allowRead: [...existing, pathToAdd],
-      denyRead: config.filesystem?.denyRead ?? [],
-      allowWrite: config.filesystem?.allowWrite ?? [],
-      denyWrite: config.filesystem?.denyWrite ?? [],
-    };
+    config.filesystem = { ...config.filesystem, allowRead: [...existing, pathToAdd] };
     writeConfigFile(configPath, config);
   }
 }
@@ -370,12 +391,7 @@ function addWritePathToConfig(configPath: string, pathToAdd: string): void {
   const config = readOrEmptyConfig(configPath);
   const existing = config.filesystem?.allowWrite ?? [];
   if (!existing.includes(pathToAdd)) {
-    config.filesystem = {
-      ...config.filesystem,
-      allowWrite: [...existing, pathToAdd],
-      denyRead: config.filesystem?.denyRead ?? [],
-      denyWrite: config.filesystem?.denyWrite ?? [],
-    };
+    config.filesystem = { ...config.filesystem, allowWrite: [...existing, pathToAdd] };
     writeConfigFile(configPath, config);
   }
 }
