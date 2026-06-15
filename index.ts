@@ -557,22 +557,28 @@ export default function (pi: ExtensionAPI) {
         allowedDomains: [...(config.network?.allowedDomains ?? []), ...sessionAllowedDomains],
         deniedDomains: config.network?.deniedDomains ?? [],
       };
-      await SandboxManager.reset();
-      await SandboxManager.initialize(
-        {
-          network,
-          filesystem: {
-            ...config.filesystem,
-            denyRead: config.filesystem?.denyRead ?? [],
-            allowRead: [...(config.filesystem?.allowRead ?? []), ...sessionAllowedReadPaths],
-            allowWrite: [...(config.filesystem?.allowWrite ?? []), ...sessionAllowedWritePaths],
-            denyWrite: config.filesystem?.denyWrite ?? [],
-          },
-          allowBrowserProcess: configExt.allowBrowserProcess,
-          enableWeakerNetworkIsolation: true,
+      // Hot-reload the allow-lists into the live sandbox config WITHOUT
+      // reset()+initialize(). Tearing the proxy servers down mid-session calls
+      // server.close(), which blocks until every in-flight proxied connection
+      // drains. omp routes its own traffic (MCP, model API, websockets) through
+      // this proxy via HTTP_PROXY/NODE_USE_ENV_PROXY, so a live keep-alive
+      // connection makes close() — and thus this reinit, awaited inside the
+      // tool_call handler — hang forever and freeze the session. updateConfig()
+      // swaps the module config in place: wrapWithSandbox reads the new
+      // filesystem rules on the next bash command and the proxy filter reads
+      // config.network live, so approvals take effect with no restart, no hang.
+      SandboxManager.updateConfig({
+        network,
+        filesystem: {
+          ...config.filesystem,
+          denyRead: config.filesystem?.denyRead ?? [],
+          allowRead: [...(config.filesystem?.allowRead ?? []), ...sessionAllowedReadPaths],
+          allowWrite: [...(config.filesystem?.allowWrite ?? []), ...sessionAllowedWritePaths],
+          denyWrite: config.filesystem?.denyWrite ?? [],
         },
-        createNetworkAskCallback(network.allowedDomains),
-      );
+        allowBrowserProcess: configExt.allowBrowserProcess,
+        enableWeakerNetworkIsolation: true,
+      });
     } catch (e) {
       console.error(`Warning: Failed to reinitialize sandbox: ${e}`);
     }
