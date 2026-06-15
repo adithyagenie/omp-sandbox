@@ -224,6 +224,51 @@ function extractBlockedWritePath(output: string): string | null {
   return match ? match[1] : null;
 }
 
+/**
+ * Collect the filesystem write targets a tool call declares in its input, so
+ * the write path policy (denyWrite hard-block / allowWrite prompt) covers not
+ * just write/edit but every tool that names the paths it mutates:
+ *   - write:    input.path
+ *   - edit:     hashline patch section headers  [<path>#<tag>]
+ *   - ast_edit: input.paths[]  (structural rewrite targets)
+ *   - lsp:      action "rename_file" -> input.file (source) + input.new_name (dest)
+ *
+ * Tools that execute opaque in-process code (eval, browser) never declare the
+ * paths they touch and cannot be covered here; gate those via tools.approval.
+ */
+function collectWriteTargets(toolName: string, input: Record<string, unknown>): string[] {
+  const targets: string[] = [];
+  const push = (v: unknown) => {
+    if (typeof v === "string" && v.length > 0) targets.push(v);
+  };
+
+  switch (toolName) {
+    case "write":
+      push(input.path);
+      break;
+    case "edit":
+      for (const value of Object.values(input)) {
+        if (typeof value !== "string") continue;
+        for (const m of value.matchAll(/^\[([^\]\n]+?)#[0-9A-Za-z]{2,}\]/gm)) {
+          targets.push(m[1]);
+        }
+      }
+      break;
+    case "ast_edit":
+      if (Array.isArray(input.paths)) {
+        for (const p of input.paths) push(p);
+      }
+      break;
+    case "lsp":
+      if (input.action === "rename_file") {
+        push(input.file);
+        push(input.new_name);
+      }
+      break;
+  }
+  return targets;
+}
+
 // ── Path pattern matching ─────────────────────────────────────────────────────
 
 function expandPath(filePath: string): string {
@@ -929,24 +974,18 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // Path policy: write/edit — prompt for allowWrite, hard-block for denyWrite.
-    if (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) {
-      const input = event.input as Record<string, unknown>;
+    // Path policy: prompt for allowWrite, hard-block for denyWrite. Covers
+    // write/edit plus any other tool that declares its write targets
+    // (ast_edit, lsp rename_file) — see collectWriteTargets. Tools running
+    // opaque code (eval, browser) cannot be path-gated here.
+    const writeTargets = collectWriteTargets(
+      event.toolName,
+      event.input as Record<string, unknown>,
+    );
+    if (writeTargets.length > 0) {
       const denyWrite = config.filesystem?.denyWrite ?? [];
 
-      // The write tool exposes `.path`; the edit tool carries a hashline patch
-      // whose sections begin with `[<path>#<tag>]`. Collect every target so the
-      // policy applies to both shapes without assuming a single `.path` field.
-      const rawTargets: string[] = [];
-      if (typeof input.path === "string") rawTargets.push(input.path);
-      for (const value of Object.values(input)) {
-        if (typeof value !== "string") continue;
-        for (const m of value.matchAll(/^\[([^\]\n]+?)#[0-9A-Za-z]{2,}\]/gm)) {
-          rawTargets.push(m[1]);
-        }
-      }
-
-      for (const rawTarget of rawTargets) {
+      for (const rawTarget of writeTargets) {
         const path = canonicalizePath(rawTarget);
 
         // denyWrite takes precedence and is never prompted.
