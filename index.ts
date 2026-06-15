@@ -64,7 +64,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
-import { getAgentDir, isToolCallEventType, settings } from "@oh-my-pi/pi-coding-agent";
+import { getAgentDir, isToolCallEventType } from "@oh-my-pi/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@oh-my-pi/pi-tui";
 import {
   SandboxManager,
@@ -460,20 +460,16 @@ export default function (pi: ExtensionAPI) {
     default: false,
   });
 
-  // Resolved lazily on first use: the Settings singleton may not be initialized
-  // at extension-load time, so we read the user's shell only once a handler runs.
-  let cachedShellPath: string | undefined;
-  const userShellPath = (): string => {
-    if (cachedShellPath === undefined) {
-      try {
-        cachedShellPath = settings.getShellConfig().shell;
-      } catch {
-        // The host may resolve this import to a separate Settings instance that
-        // was never initialized; fall back to the login shell so bash still runs.
-        cachedShellPath = process.env.SHELL ?? "/bin/bash";
-      }
+  // The sandboxed bash tool and user_bash always run POSIX bash, never the
+  // user's interactive shell: the agent emits bash syntax, and an interactive
+  // shell (e.g. fish) both mangles it and noisily fails to write its RC files
+  // under the read-only home. Resolved once, lazily.
+  let cachedBashPath: string | undefined;
+  const bashShellPath = (): string => {
+    if (cachedBashPath === undefined) {
+      cachedBashPath = ["/bin/bash", "/usr/bin/bash", "/bin/sh"].find((p) => existsSync(p)) ?? "/bin/sh";
     }
-    return cachedShellPath;
+    return cachedBashPath;
   };
 
   let sandboxEnabled = false;
@@ -773,7 +769,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params, signal, onUpdate, ctx) {
       const cwd = params.cwd ?? ctx.cwd;
       const runBash = async () => {
-        const run = await runSandboxedShell(params.command, cwd, userShellPath(), {
+        const run = await runSandboxedShell(params.command, cwd, bashShellPath(), {
           signal,
           timeout: params.timeout,
           wrap: sandboxEnabled && sandboxInitialized,
@@ -869,7 +865,7 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    const run = await runSandboxedShell(event.command, ctx.cwd, userShellPath(), { wrap: true });
+    const run = await runSandboxedShell(event.command, ctx.cwd, bashShellPath(), { wrap: true });
     return {
       result: {
         output: run.output,
