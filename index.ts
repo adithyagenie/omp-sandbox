@@ -219,6 +219,157 @@ function extractDomainsFromCommand(command: string): string[] {
   return [...domains];
 }
 
+// ── SSH target extraction ─────────────────────────────────────────────────────
+
+/**
+ * Binaries that can open an interactive remote channel over ssh. ssh/scp/sftp
+ * are the OpenSSH clients; rsync is included only when its args contain an
+ * ssh-transport remote (user@host: / host:); git only for `clone` with an
+ * ssh-style remote. Purely-local rsync/git produce no targets and are ungated.
+ */
+const SSH_BINARIES: Record<string, true> = {
+  ssh: true, scp: true, sftp: true, rsync: true, git: true,
+};
+
+/** Short options whose following token is an argument (not a host), per binary. */
+const SSH_OPT_TAKES_ARG: Record<string, Record<string, true>> = {
+  ssh: { b: true, c: true, F: true, i: true, J: true, L: true, l: true, m: true, o: true, O: true, p: true, R: true, w: true, D: true, W: true, S: true, I: true, E: true, B: true, Q: true },
+  scp: { i: true, l: true, o: true, P: true, F: true, c: true, J: true, S: true },
+  sftp: { i: true, b: true, c: true, F: true, J: true, l: true, o: true, P: true, S: true },
+  rsync: { e: true },
+};
+
+/** Command wrappers to skip when locating the real binary in a token stream. */
+const SHELL_WRAPPERS: Record<string, true> = {
+  sudo: true, doas: true, nice: true, time: true, nohup: true, env: true, command: true, exec: true, xargs: true, strace: true, ltrace: true,
+};
+
+/**
+ * Split a shell segment into tokens, honouring single/double quotes (the quote
+ * chars are dropped, inner content kept as one token). This prevents quoted
+ * option values like `ProxyCommand="nc host 22"` from leaking their inner
+ * whitespace as spurious host/alias tokens. Not a full shell parser — no escape
+ * or expansion handling — but sufficient for ssh host extraction.
+ */
+function shellTokens(s: string): string[] {
+  const out: string[] = [];
+  let cur = "";
+  let quote: string | null = null;
+  for (let k = 0; k < s.length; k++) {
+    const ch = s[k];
+    if (quote) {
+      if (ch === quote) quote = null;
+      else cur += ch;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (/\s/.test(ch)) {
+      if (cur) { out.push(cur); cur = ""; }
+    } else {
+      cur += ch;
+    }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+function isHostLike(h: string): boolean {
+  return (
+    /^[A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,}$/.test(h) || // FQDN
+    /^(\d{1,3}\.){3}\d{1,3}$/.test(h) // IPv4
+  );
+}
+
+/**
+ * Pull a host out of a remote-style token: `user@host:path`, `host:path`,
+ * `host::module` (rsync daemon), `user@host`, or a bare FQDN/IP. Returns null
+ * for local paths (incl. Windows `C:\`) and bare filenames with no `:`/`@` —
+ * so `file.tgz` in an scp/rsync stream is not mistaken for a host. ssh:// is
+ * handled separately by the caller's regex.
+ */
+function hostFromRemoteToken(token: string): string | null {
+  if (/^[A-Za-z]:[\\/]/.test(token) || token.startsWith("/")) return null;
+  const hadAt = token.includes("@");
+  const at = token.lastIndexOf("@");
+  const tok = at >= 0 ? token.slice(at + 1) : token;
+  const daemon = tok.match(/^([A-Za-z0-9][A-Za-z0-9.\-]*)::/);
+  if (daemon) return daemon[1];
+  const colon = tok.indexOf(":");
+  if (colon > 0) {
+    const host = tok.slice(0, colon);
+    if (/^[A-Za-z0-9][A-Za-z0-9.\-]*$/.test(host)) return host;
+    return null;
+  }
+  if (hadAt && isHostLike(tok)) return tok;
+  return null;
+}
+
+/**
+ * Extract ssh target hosts from a command string. Splits on shell separators
+ * (; | & \n) so `echo hi; ssh host` is caught. For ssh/sftp the target is the
+ * first non-option token (option values skipped via SSH_OPT_TAKES_ARG; a bare
+ * alias like `ssh prod` with no dot/IP is still captured). For scp/rsync every
+ * remote-style token is collected. For git only `clone` with an ssh remote
+ * (git@host: or ssh://) yields a target. Returns best-effort host labels used
+ * for the confirmation prompt and persistence.
+ */
+function extractSshTargets(command: string): string[] {
+  const targets = new Set<string>();
+
+  const sshUrlRe = /ssh:\/\/(?:[^@\s/]+@)?([A-Za-z0-9][A-Za-z0-9.\-]+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = sshUrlRe.exec(command)) !== null) targets.add(m[1]);
+
+  for (const seg of command.split(/[\n;|&]+/)) {
+    const tokens = shellTokens(seg);
+    if (tokens.length === 0) continue;
+
+    let i = 0;
+    while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i])) i++;
+    while (i < tokens.length && SHELL_WRAPPERS[tokens[i]]) {
+      i++;
+      while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i])) i++;
+    }
+    if (i >= tokens.length) continue;
+    const bin = tokens[i].replace(/^.*\//, "");
+    if (!SSH_BINARIES[bin]) continue;
+
+    if (bin === "git") {
+      if (tokens[i + 1] !== "clone") continue;
+      for (let j = i + 2; j < tokens.length; j++) {
+        const t = tokens[j];
+        if (t.startsWith("-")) continue;
+        if (t.includes("://")) break; // ssh:// handled by regex above; http(s)/git/file:// are not ssh
+        const h = hostFromRemoteToken(t);
+        if (h) targets.add(h);
+        break; // first non-option token is the remote URL
+      }
+      continue;
+    }
+
+    const argOpts = SSH_OPT_TAKES_ARG[bin];
+    const scanAll = bin === "scp" || bin === "rsync";
+    for (let j = i + 1; j < tokens.length; j++) {
+      const t = tokens[j];
+      if (t.startsWith("--")) continue;
+      if (/^-[A-Za-z]/.test(t)) {
+        const last = t[t.length - 1];
+        if (argOpts?.[last] && !t.includes("=") && j + 1 < tokens.length) j++;
+        continue;
+      }
+      const h = hostFromRemoteToken(t);
+      if (h) {
+        targets.add(h);
+        if (!scanAll) break;
+      } else if (!scanAll) {
+        const at = t.lastIndexOf("@");
+        targets.add(at >= 0 ? t.slice(at + 1) : t); // bare alias: `ssh prod`
+        break;
+      }
+    }
+  }
+  return [...targets];
+}
+
 function domainMatchesPattern(domain: string, pattern: string): boolean {
   if (pattern === "*") return true;
   if (pattern.startsWith("*.")) {
@@ -238,6 +389,52 @@ function domainIsAllowed(domain: string, allowedDomains: string[]): boolean {
 
 function createNetworkAskCallback(allowedDomains: string[]): SandboxAskCallback {
   return async ({ host }) => domainIsAllowed(host, allowedDomains);
+}
+
+/**
+ * "Allow all egress" (allowedDomains contains "*") with nothing denied means
+ * there is no allowlist left to enforce. On Linux the proxy path still forces
+ * bwrap --unshare-net, which strips every network interface and tunnels only
+ * HTTP(S) through a socat/Unix-socket bridge — so dig/nslookup (raw UDP:53),
+ * nc, ping, and every non-HTTP protocol fail with "network unreachable" even
+ * though egress is supposedly unrestricted. sandbox-runtime treats an UNDEFINED
+ * allowedDomains as "no network restriction" (needsNetworkRestriction =
+ * allowedDomains !== undefined), skipping --unshare-net so the bash namespace
+ * shares the host network. We only take this path when nothing is denied: a
+ * denylist still needs the proxy to enforce it.
+ */
+function isUnrestrictedNetwork(network: SandboxConfig["network"]): boolean {
+  return allowsAllDomains(network?.allowedDomains) && (network?.deniedDomains?.length ?? 0) === 0;
+}
+
+/**
+ * Build the network config handed to sandbox-runtime. Under allow-all-with-no-
+ * denies we omit allowedDomains so the runtime disables network isolation and
+ * shares the host network (DNS, UDP, raw sockets all work); filesystem
+ * isolation is untouched. Otherwise we merge session grants into the allowlist
+ * and the filtering proxy enforces it as before.
+ */
+function buildRuntimeNetwork(
+  network: SandboxConfig["network"],
+  sessionDomains: string[],
+): SandboxRuntimeConfig["network"] {
+  if (isUnrestrictedNetwork(network)) {
+    // allowedDomains: undefined -> sandbox-runtime skips --unshare-net. network
+    // must stay an object: initialize()/updateConfig() read network.parentProxy.
+    return { ...network, allowedDomains: undefined, deniedDomains: [] } as unknown as SandboxRuntimeConfig["network"];
+  }
+  return {
+    ...network,
+    allowedDomains: [...(network?.allowedDomains ?? []), ...sessionDomains],
+    deniedDomains: network?.deniedDomains ?? [],
+  };
+}
+
+/** Human-readable network mode for the status line. */
+function formatNetworkLabel(network: SandboxConfig["network"]): string {
+  if (isUnrestrictedNetwork(network)) return "unrestricted (host network)";
+  if (allowsAllDomains(network?.allowedDomains)) return "all domains";
+  return `${network?.allowedDomains?.length ?? 0} domains`;
 }
 
 // ── Output analysis ───────────────────────────────────────────────────────────
@@ -512,9 +709,69 @@ function outputStats(output: string): {
   };
 }
 
+const RUNNER_EXTENSION_HANDLER_TIMEOUT_MS = 30_000;
+const SANDBOX_APPROVAL_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+const SET_TIMEOUT_BRIDGE_KEY = Symbol.for("pi-sandbox-omp.extensionHandlerTimeoutBridge");
+
+interface SetTimeoutBridge {
+  armRunnerTimeout(): void;
+}
+
+interface GlobalWithTimeoutBridge {
+  [SET_TIMEOUT_BRIDGE_KEY]?: SetTimeoutBridge;
+}
+
+function getExtensionHandlerTimeoutBridge(): SetTimeoutBridge {
+  const global = globalThis as typeof globalThis & GlobalWithTimeoutBridge;
+  const existing = global[SET_TIMEOUT_BRIDGE_KEY];
+  if (existing) return existing;
+
+  const originalSetTimeout = globalThis.setTimeout.bind(globalThis) as typeof globalThis.setTimeout;
+  let armedHandlerCount = 0;
+
+  const bridge: SetTimeoutBridge = {
+    armRunnerTimeout() {
+      armedHandlerCount += 1;
+      queueMicrotask(() => {
+        armedHandlerCount = Math.max(0, armedHandlerCount - 1);
+      });
+    },
+  };
+
+  globalThis.setTimeout = ((
+    handler: Parameters<typeof globalThis.setTimeout>[0],
+    timeout?: Parameters<typeof globalThis.setTimeout>[1],
+    ...args: unknown[]
+  ) => {
+    const shouldExtendTimeout = armedHandlerCount > 0 && timeout === RUNNER_EXTENSION_HANDLER_TIMEOUT_MS;
+    if (shouldExtendTimeout) armedHandlerCount -= 1;
+    const scopedTimeout = shouldExtendTimeout ? SANDBOX_APPROVAL_TIMEOUT_MS : timeout;
+    return originalSetTimeout(handler, scopedTimeout, ...args);
+  }) as typeof globalThis.setTimeout;
+
+  global[SET_TIMEOUT_BRIDGE_KEY] = bridge;
+  return bridge;
+}
+
+function withExtensionHandlerTimeoutBridge<TArgs extends unknown[], TResult>(
+  bridge: SetTimeoutBridge,
+  handler: (...args: TArgs) => TResult,
+): (...args: TArgs) => TResult {
+  return (...args) => {
+    try {
+      return handler(...args);
+    } finally {
+      bridge.armRunnerTimeout();
+    }
+  };
+}
+
 // ── Extension ─────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  process.env.CLAUDE_TMPDIR ??= "/tmp";
+  const timeoutBridge = getExtensionHandlerTimeoutBridge();
+
   pi.registerFlag("no-sandbox", {
     description: "Disable OS-level sandboxing for bash commands",
     type: "boolean",
@@ -568,11 +825,7 @@ export default function (pi: ExtensionAPI) {
     const config = loadConfig(cwd);
     const configExt = config as unknown as { allowBrowserProcess?: boolean };
     try {
-      const network = {
-        ...config.network,
-        allowedDomains: [...(config.network?.allowedDomains ?? []), ...sessionAllowedDomains],
-        deniedDomains: config.network?.deniedDomains ?? [],
-      };
+      const network = buildRuntimeNetwork(config.network, sessionAllowedDomains);
       // Hot-reload the allow-lists into the live sandbox config WITHOUT
       // reset()+initialize(). Tearing the proxy servers down mid-session calls
       // server.close(), which blocks until every in-flight proxied connection
@@ -773,13 +1026,44 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
+  /**
+   * SSH confirmation gate. ssh/scp/sftp/rsync-over-ssh are interactive remote
+   * channels: they require explicit per-host confirmation even when the network
+   * is otherwise unrestricted (allowedDomains "*"). A bare "*" does NOT
+   * auto-approve ssh — every ssh host prompts the first time, mirroring
+   * read/write path confirmation. Approval persists per host via allowedDomains,
+   * so a host approved once (session/project/global) is silent thereafter.
+   * Returns the host string if the user aborted (block), else null.
+   */
+  async function enforceSshGate(
+    command: string,
+    ctx: ExtensionContext,
+  ): Promise<string | null> {
+    for (const host of extractSshTargets(command)) {
+      const approved = getEffectiveAllowedDomains(ctx.cwd).some(
+        (p) => p !== "*" && domainMatchesPattern(host, p),
+      );
+      if (approved) continue;
+      const choice = await showPermissionPrompt(
+        ctx,
+        `🔐 SSH blocked: ssh to "${host}" requires confirmation`,
+        PERMISSION_OPTIONS,
+      );
+      if (choice === "abort") return host;
+      await applyDomainChoice(choice, host, ctx.cwd);
+    }
+    return null;
+  }
+
   function warnIfAllDomainsAllowed(ctx: ExtensionContext, config: SandboxConfig): void {
     if (!allowsAllDomains(config.network?.allowedDomains)) return;
-    ctx.ui.notify(
-      '⚠️ Network sandbox allows all domains because network.allowedDomains contains "*". ' +
-        'Only use this intentionally; remove "*" to restore per-domain prompts.',
-      "warning",
-    );
+    const msg = isUnrestrictedNetwork(config.network)
+      ? '⚠️ Network isolation is DISABLED: allowedDomains is "*" with no deniedDomains, so ' +
+        "sandboxed commands share the host network (raw sockets, DNS, and host loopback are " +
+        'reachable). Add a deniedDomains entry or remove "*" to re-enable the filtering proxy.'
+      : '⚠️ Network sandbox allows all domains because network.allowedDomains contains "*". ' +
+        'Only use this intentionally; remove "*" to restore per-domain prompts.';
+    ctx.ui.notify(msg, "warning");
   }
 
   // ── Apply allowance choices ─────────────────────────────────────────────────
@@ -907,7 +1191,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── user_bash — network pre-check ──────────────────────────────────────────
 
-  pi.on("user_bash", async (event, ctx) => {
+  pi.on("user_bash", withExtensionHandlerTimeoutBridge(timeoutBridge, async (event, ctx) => {
     if (!sandboxEnabled || !sandboxInitialized) return;
 
     const domains = extractDomainsFromCommand(event.command);
@@ -932,6 +1216,20 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
+    const sshBlockedHost = await enforceSshGate(event.command, ctx);
+    if (sshBlockedHost) {
+      const output = `Blocked: SSH to "${sshBlockedHost}" was not confirmed. Use /sandbox to review.`;
+      return {
+        result: {
+          output,
+          exitCode: 1,
+          cancelled: false,
+          truncated: false,
+          ...outputStats(output),
+        },
+      };
+    }
+
     const run = await runSandboxedShell(event.command, ctx.cwd, bashShellPath(), { wrap: true });
     return {
       result: {
@@ -942,11 +1240,11 @@ export default function (pi: ExtensionAPI) {
         ...outputStats(run.output),
       },
     };
-  });
+  }));
 
   // ── tool_call — network pre-check for bash, path policy for read/write/edit
 
-  pi.on("tool_call", async (event, ctx) => {
+  pi.on("tool_call", withExtensionHandlerTimeoutBridge(timeoutBridge, async (event, ctx) => {
     if (!sandboxEnabled) return;
 
     const config = loadConfig(ctx.cwd);
@@ -969,6 +1267,13 @@ export default function (pi: ExtensionAPI) {
           }
           await applyDomainChoice(choice, domain, ctx.cwd);
         }
+      }
+      const sshBlockedHost = await enforceSshGate(event.input.command, ctx);
+      if (sshBlockedHost) {
+        return {
+          block: true,
+          reason: `Sandbox: SSH to "${sshBlockedHost}" requires confirmation.`,
+        };
       }
     }
 
@@ -1033,7 +1338,7 @@ export default function (pi: ExtensionAPI) {
         }
       }
     }
-  });
+  }));
 
   // ── session_start ───────────────────────────────────────────────────────────
 
@@ -1070,7 +1375,7 @@ export default function (pi: ExtensionAPI) {
 
       await SandboxManager.initialize(
         {
-          network: config.network,
+          network: buildRuntimeNetwork(config.network, sessionAllowedDomains),
           filesystem: config.filesystem,
           ignoreViolations: configExt.ignoreViolations,
           enableWeakerNestedSandbox: configExt.enableWeakerNestedSandbox,
@@ -1096,9 +1401,7 @@ export default function (pi: ExtensionAPI) {
 
       warnIfAllDomainsAllowed(ctx, config);
 
-      const networkLabel = allowsAllDomains(config.network?.allowedDomains)
-        ? "all domains"
-        : `${config.network?.allowedDomains?.length ?? 0} domains`;
+      const networkLabel = formatNetworkLabel(config.network);
       const writeCount = config.filesystem?.allowWrite?.length ?? 0;
       ctx.ui.setStatus(
         "sandbox",
@@ -1151,7 +1454,7 @@ export default function (pi: ExtensionAPI) {
 
         await SandboxManager.initialize(
           {
-            network: config.network,
+            network: buildRuntimeNetwork(config.network, sessionAllowedDomains),
             filesystem: config.filesystem,
             ignoreViolations: configExt.ignoreViolations,
             enableWeakerNestedSandbox: configExt.enableWeakerNestedSandbox,
@@ -1166,9 +1469,7 @@ export default function (pi: ExtensionAPI) {
 
         warnIfAllDomainsAllowed(ctx, config);
 
-        const networkLabel = allowsAllDomains(config.network?.allowedDomains)
-          ? "all domains"
-          : `${config.network?.allowedDomains?.length ?? 0} domains`;
+        const networkLabel = formatNetworkLabel(config.network);
         const writeCount = config.filesystem?.allowWrite?.length ?? 0;
         ctx.ui.setStatus(
           "sandbox",
@@ -1225,9 +1526,11 @@ export default function (pi: ExtensionAPI) {
         "",
         "Network (bash + !cmd):",
         `  Allowed domains: ${config.network?.allowedDomains?.join(", ") || "(none)"}`,
-        ...(allowsAllDomains(config.network?.allowedDomains)
-          ? ['  ⚠️ "*" allows all domains and disables per-domain prompts.']
-          : []),
+        ...(isUnrestrictedNetwork(config.network)
+          ? ['  ⚠️ "*" with no deniedDomains: network isolation disabled (host network shared).']
+          : allowsAllDomains(config.network?.allowedDomains)
+            ? ['  ⚠️ "*" allows all domains and disables per-domain prompts.']
+            : []),
         `  Denied domains:  ${config.network?.deniedDomains?.join(", ") || "(none)"}`,
         ...(sessionAllowedDomains.length > 0
           ? [`  Session allowed: ${sessionAllowedDomains.join(", ")}`]
