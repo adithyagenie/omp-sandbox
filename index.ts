@@ -671,6 +671,10 @@ async function runSandboxedShell(
     if (settled) return;
     settled = true;
     cleanup();
+    // Remove bwrap mount-point ghost files (.env/.bashrc/.claude/...) the
+    // runtime creates for non-existent deny paths. Uses the runtime's public
+    // cleanup API (cleanupAfterCommand) — no node_modules patching.
+    SandboxManager.cleanupAfterCommand();
 
     if (opts.signal?.aborted) {
       reject(new Error("aborted"));
@@ -769,7 +773,11 @@ function withExtensionHandlerTimeoutBridge<TArgs extends unknown[], TResult>(
 // ── Extension ─────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  process.env.CLAUDE_TMPDIR ??= "/tmp";
+  // sandbox-runtime reads CLAUDE_TMPDIR for its proxy/bridge tmpdir (defaulting
+  // to /tmp/claude if unset). Prefer OMP_TMPDIR, else /tmp, so no .claude path
+  // is ever created on disk. The env-var name is the runtime's public contract —
+  // it can't be renamed without patching node_modules.
+  process.env.CLAUDE_TMPDIR ??= process.env.OMP_TMPDIR ?? "/tmp";
   const timeoutBridge = getExtensionHandlerTimeoutBridge();
 
   pi.registerFlag("no-sandbox", {
