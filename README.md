@@ -1,16 +1,40 @@
 # pi-sandbox-omp
 
-OS-level sandboxing for [omp](https://github.com/) (oh-my-pi): restricts what
-bash commands can write/read, what network hosts they can reach, and gates every
-ssh command behind a confirmation — with interactive permission prompts. A
-functional rewrite of `carderne/pi-sandbox` for the `@oh-my-pi` runtime.
+OS-level sandboxing for [omp](https://omp.sh/): restricts what bash commands
+can read/write, what network hosts they can reach, and gates every ssh command
+behind an interactive confirmation.
+
+This project is ported from
+[`carderne/pi-sandbox`](https://github.com/carderne/pi-sandbox), originally
+written for [pi](https://pi.dev/).
+
+> [!WARNING]
+> This sandbox is vibe-coded. Expect it to break. Treat it as experimental,
+> review its permissions and source, and do not rely on it as a hardened
+> security boundary.
 
 It uses `@carderne/sandbox-runtime` (Anthropic Sandbox Runtime / ASRT) to enforce
 filesystem and network restrictions on bash commands at the OS level
 (`sandbox-exec` on macOS, `bubblewrap` + a filtering proxy on Linux), and
 intercepts omp's `read`, `write`, `edit`, and `bash` tools to apply the same
 allow/deny rules in-process (those tools run in Node, not in a subprocess, so the
-OS sandbox can't see them).
+OS sandbox cannot see them).
+
+## Changes from `carderne/pi-sandbox`
+
+- Ported the extension manifest and runtime imports from pi to omp
+  (`omp.extensions`, `@oh-my-pi/pi-coding-agent`, and `@oh-my-pi/pi-tui`).
+- Migrated user and project configuration from `.pi` to `.omp`
+  (`~/.omp/agent/sandbox.json` and `<cwd>/.omp/sandbox.json`).
+- Added local installation through `omp plugin link`.
+- Added an explicit per-host confirmation gate for `ssh`, `scp`, `sftp`,
+  remote `rsync`, and ssh-based `git clone`; a network wildcard does not
+  automatically approve ssh.
+- Added true unrestricted networking for `allowedDomains: ["*"]` with no
+  denied domains, sharing the host network so UDP, raw sockets, and ssh work.
+- Added a reproducible Bun patch for `@carderne/sandbox-runtime` that prevents
+  non-existent deny paths from creating ghost dotfiles and migrates runtime
+  paths/TMPDIR handling to `.omp`.
 
 ## What it sandboxes
 
@@ -131,10 +155,10 @@ When a read/write/network/ssh action is not pre-approved, a prompt offers:
 ## Known behaviors & limitations
 
 - **Ghost dotfiles (prevented)**: on Linux, the upstream runtime mounts
-  `/dev/null` over non-existent deny paths (e.g. `.env`, `.bashrc`, `.claude`)
+  `/dev/null` over non-existent deny paths (e.g. `.env`, `.bashrc`, `.omp`)
   to block their creation, which forces bwrap to create empty host mount-point
   files — leaving ghost dotfiles in the working directory. This is prevented by
-  a **reproducible bun patch** (`patches/@carderne%2Fsandbox-runtime@0.0.49.patch`,
+  a **reproducible bun patch** (`patches/sandbox-runtime@0.0.49.patch`,
   registered in `package.json#patchedDependencies`) that makes the runtime skip
   non-existent deny paths instead of mount-pointing them. `bun install` applies
   it automatically — no direct `node_modules` editing, and a fresh clone gets
@@ -143,9 +167,6 @@ When a read/write/network/ssh action is not pre-approved, a prompt offers:
 - **ssh in restricted mode**: bare `ssh` does not honor `ALL_PROXY`, so once
   approved it may still fail to connect under `--unshare-net`. In unrestricted
   (`["*"]`) mode ssh connects natively (host network shared).
-- **`CLAUDE_TMPDIR`**: the runtime reads this env var for its proxy/bridge
-  tmpdir (defaulting to `/tmp/claude`). The plugin sets it to `OMP_TMPDIR` or
-  `/tmp` so no `.claude` path is created; the var name is the runtime's public
-  contract and can't be renamed without patching.
-- **`.claude/debug` bind**: the upstream runtime binds `~/.claude/debug` for
-  proxy debug logs. This is an upstream behavior the plugin does not alter.
+- **OMP runtime paths**: the reproducible patch changes runtime tmpdir,
+  command-directory, and debug paths to OMP-native names: `OMP_TMPDIR`
+  (default `/tmp/omp`), `.omp/commands`, `.omp/agents`, and `~/.omp/debug`.

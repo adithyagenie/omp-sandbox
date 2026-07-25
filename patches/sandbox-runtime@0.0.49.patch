@@ -1,0 +1,178 @@
+--- a/dist/sandbox/linux-sandbox-utils.js
++++ b/dist/sandbox/linux-sandbox-utils.js
+@@ -561,65 +561,22 @@
+             }
+             // Check for symlinks in the path - if any parent component is a symlink,
+             // mount /dev/null there to prevent symlink replacement attacks.
+-            // Attack scenario: .claude is a symlink to ./decoy/, attacker deletes
+-            // symlink and creates real .claude/settings.json with malicious hooks.
++            // Attack scenario: .omp is a symlink to ./decoy/, attacker deletes
++            // symlink and creates real .omp/settings.json with malicious hooks.
+             const symlinkInPath = findSymlinkInPath(normalizedPath, allowedWritePaths);
+             if (symlinkInPath) {
+                 denyWriteArgs.push('--ro-bind', '/dev/null', symlinkInPath);
+                 logForDebugging(`[Sandbox Linux] Mounted /dev/null at symlink ${symlinkInPath} to prevent symlink replacement attack`);
+                 continue;
+             }
+-            // Handle non-existent paths by mounting /dev/null to block creation.
+-            // Without this, a sandboxed process could mkdir+write a denied path that
+-            // doesn't exist yet, bypassing the deny rule entirely.
+-            //
+-            // bwrap creates empty files on the host as mount points for these binds.
+-            // We track them in bwrapMountPoints so cleanupBwrapMountPoints() can
+-            // remove them after the command exits.
+-            if (!fs.existsSync(normalizedPath)) {
+-                // Fix 1 (worktree): If any existing component in the deny path is a
+-                // file (not a directory), skip the deny entirely. You can't mkdir
+-                // under a file, so the deny path can never be created. This handles
+-                // git worktrees where .git is a file.
+-                if (hasFileAncestor(normalizedPath)) {
+-                    logForDebugging(`[Sandbox Linux] Skipping deny path with file ancestor (cannot create paths under a file): ${normalizedPath}`);
+-                    continue;
+-                }
+-                // Find the deepest existing ancestor directory
+-                let ancestorPath = path.dirname(normalizedPath);
+-                while (ancestorPath !== '/' && !fs.existsSync(ancestorPath)) {
+-                    ancestorPath = path.dirname(ancestorPath);
+-                }
+-                // Only protect if the existing ancestor is within an allowed write path.
+-                // If not, the path is already read-only from --ro-bind / /.
+-                const ancestorIsWithinAllowedPath = allowedWritePaths.some(allowedPath => ancestorPath.startsWith(allowedPath + '/') ||
+-                    ancestorPath === allowedPath ||
+-                    normalizedPath.startsWith(allowedPath + '/'));
+-                if (ancestorIsWithinAllowedPath) {
+-                    const firstNonExistent = findFirstNonExistentComponent(normalizedPath);
+-                    // Fix 2: If firstNonExistent is an intermediate component (not the
+-                    // leaf deny path itself), mount a read-only empty directory instead
+-                    // of /dev/null. This prevents the component from appearing as a file
+-                    // which breaks tools that expect to traverse it as a directory.
+-                    if (firstNonExistent !== normalizedPath) {
+-                        const emptyDir = fs.mkdtempSync(path.join(tmpdir(), 'claude-empty-'));
+-                        denyWriteArgs.push('--ro-bind', emptyDir, firstNonExistent);
+-                        bwrapMountPoints.add(firstNonExistent);
+-                        registerExitCleanupHandler();
+-                        logForDebugging(`[Sandbox Linux] Mounted empty dir at ${firstNonExistent} to block creation of ${normalizedPath}`);
+-                    }
+-                    else {
+-                        denyWriteArgs.push('--ro-bind', '/dev/null', firstNonExistent);
+-                        bwrapMountPoints.add(firstNonExistent);
+-                        registerExitCleanupHandler();
+-                        logForDebugging(`[Sandbox Linux] Mounted /dev/null at ${firstNonExistent} to block creation of ${normalizedPath}`);
+-                    }
+-                }
+-                else {
+-                    logForDebugging(`[Sandbox Linux] Skipping non-existent deny path not within allowed paths: ${normalizedPath}`);
+-                }
+-                continue;
+-            }
++            // Non-existent deny paths are skipped, not mount-pointed. Binding
++            // /dev/null (or an empty dir) over a path that doesn't exist forces
++            // bwrap to CREATE the destination as a mount point, leaving ghost
++            // dotfiles (.env, .bashrc, .omp, ...) in the working directory.
++            // Skipping means a sandboxed process could create such a path and
++            // write to it — accepted per the user's preference for a clean cwd.
++            // Existing deny paths below are still bound read-only.
++            if (!fs.existsSync(normalizedPath)) continue;
+             // Only add deny binding if this path is within an allowed write path
+             // Otherwise it's already read-only from the initial --ro-bind / /
+             const isWithinAllowedPath = allowedWritePaths.some(allowedPath => normalizedPath.startsWith(allowedPath + '/') ||
+--- a/dist/sandbox/sandbox-manager.js
++++ b/dist/sandbox/sandbox-manager.js
+@@ -443,7 +443,7 @@
+     const platform = getPlatform();
+     // Get configs - use custom if provided, otherwise fall back to main config
+     // If neither exists, defaults to empty arrays (most restrictive)
+-    // Always include default system write paths (like /dev/null, /tmp/claude)
++    // Always include default system write paths (like /dev/null, /tmp/omp)
+     //
+     // Strip trailing /** and filter remaining globs on Linux (bwrap needs
+     // real paths, not globs; macOS subpath matching is also recursive so
+--- a/dist/sandbox/sandbox-utils.d.ts
++++ b/dist/sandbox/sandbox-utils.d.ts
+@@ -17,7 +17,7 @@
+ /**
+  * Normalizes a path for case-insensitive comparison.
+  * This prevents bypassing security checks using mixed-case paths on case-insensitive
+- * filesystems (macOS/Windows) like `.cLauDe/Settings.locaL.json`.
++ * filesystems (macOS/Windows) like `.oMp/Settings.locaL.json`.
+  *
+  * We always normalize to lowercase regardless of platform for consistent security.
+  * @param path The path to normalize
+--- a/dist/sandbox/sandbox-utils.js
++++ b/dist/sandbox/sandbox-utils.js
+@@ -31,14 +31,14 @@
+ export function getDangerousDirectories() {
+     return [
+         ...DANGEROUS_DIRECTORIES.filter(d => d !== '.git'),
+-        '.claude/commands',
+-        '.claude/agents',
++        '.omp/commands',
++        '.omp/agents',
+     ];
+ }
+ /**
+  * Normalizes a path for case-insensitive comparison.
+  * This prevents bypassing security checks using mixed-case paths on case-insensitive
+- * filesystems (macOS/Windows) like `.cLauDe/Settings.locaL.json`.
++ * filesystems (macOS/Windows) like `.oMp/Settings.locaL.json`.
+  *
+  * We always normalize to lowercase regardless of platform for consistent security.
+  * @param path The path to normalize
+@@ -86,7 +86,7 @@
+     }
+     // Handle macOS /tmp -> /private/tmp canonical resolution
+     // This is a legitimate system symlink that should be allowed
+-    // /tmp/claude -> /private/tmp/claude is OK
++    // /tmp/omp -> /private/tmp/omp is OK
+     // /var/folders/... -> /private/var/folders/... is OK
+     if (normalizedOriginal.startsWith('/tmp/') &&
+         normalizedResolved === '/private' + normalizedOriginal) {
+@@ -116,12 +116,12 @@
+         return true;
+     }
+     // If original path starts with resolved path, the resolved path is an ancestor
+-    // e.g., /tmp/claude -> /tmp means the symlink points to a broader scope
++    // e.g., /tmp/omp -> /tmp means the symlink points to a broader scope
+     if (normalizedOriginal.startsWith(normalizedResolved + '/')) {
+         return true;
+     }
+     // Also check the canonical form of the original path for macOS
+-    // e.g., /tmp/claude should also be checked as /private/tmp/claude
++    // e.g., /tmp/omp should also be checked as /private/tmp/omp
+     let canonicalOriginal = normalizedOriginal;
+     if (normalizedOriginal.startsWith('/tmp/')) {
+         canonicalOriginal = '/private' + normalizedOriginal;
+@@ -138,7 +138,7 @@
+     // 1. Start with the original path (deeper/same) - already covered by returning false below
+     // 2. Start with the canonical original (deeper/same under canonical form)
+     // 3. BE the canonical form of the original (e.g., /tmp/x -> /private/tmp/x)
+-    // Any other resolution (e.g., /tmp/claude -> /Users/dworken) is outside expected bounds
++    // Any other resolution (e.g., /tmp/omp -> /Users/dworken) is outside expected bounds
+     const resolvedStartsWithOriginal = normalizedResolved.startsWith(normalizedOriginal + '/');
+     const resolvedStartsWithCanonical = canonicalOriginal !== normalizedOriginal &&
+         normalizedResolved.startsWith(canonicalOriginal + '/');
+@@ -244,10 +244,10 @@
+         '/dev/tty',
+         '/dev/dtracehelper',
+         '/dev/autofs_nowait',
+-        '/tmp/claude',
+-        '/private/tmp/claude',
++        '/tmp/omp',
++        '/private/tmp/omp',
+         path.join(homeDir, '.npm/_logs'),
+-        path.join(homeDir, '.claude/debug'),
++        path.join(homeDir, '.omp/debug'),
+     ];
+     return recommendedPaths;
+ }
+@@ -255,8 +255,8 @@
+  * Generate proxy environment variables for sandboxed processes
+  */
+ export function generateProxyEnvVars(httpProxyPort, socksProxyPort) {
+-    // Respect CLAUDE_TMPDIR if set, otherwise default to /tmp/claude
+-    const tmpdir = process.env.CLAUDE_TMPDIR || '/tmp/claude';
++    // Respect OMP_TMPDIR if set, otherwise default to /tmp/omp
++    const tmpdir = process.env.OMP_TMPDIR || '/tmp/omp';
+     const envVars = [`SANDBOX_RUNTIME=1`, `TMPDIR=${tmpdir}`];
+     // If no proxy ports provided, return minimal env vars
+     if (!httpProxyPort && !socksProxyPort) {

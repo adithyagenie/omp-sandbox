@@ -769,11 +769,9 @@ function withExtensionHandlerTimeoutBridge<TArgs extends unknown[], TResult>(
 // ── Extension ─────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  // sandbox-runtime reads CLAUDE_TMPDIR for its proxy/bridge tmpdir (defaulting
-  // to /tmp/claude if unset). Prefer OMP_TMPDIR, else /tmp, so no .claude path
-  // is ever created on disk. The env-var name is the runtime's public contract —
-  // it can't be renamed without patching node_modules.
-  process.env.CLAUDE_TMPDIR ??= process.env.OMP_TMPDIR ?? "/tmp";
+  const ompTmpDir = process.env.OMP_TMPDIR ?? "/tmp/omp";
+  process.env.OMP_TMPDIR = ompTmpDir;
+  mkdirSync(ompTmpDir, { recursive: true });
   const timeoutBridge = getExtensionHandlerTimeoutBridge();
 
   pi.registerFlag("no-sandbox", {
