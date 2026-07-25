@@ -11,5 +11,8 @@
   },
   "dependencies": {
     "@carderne/sandbox-runtime": "^0.0.49"
+  },
+  "patchedDependencies": {
+    "@carderne/sandbox-runtime@0.0.49": "patches/@carderne%2Fsandbox-runtime@0.0.49.patch"
   }
 }

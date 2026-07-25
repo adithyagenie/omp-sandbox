@@ -130,14 +130,16 @@ When a read/write/network/ssh action is not pre-approved, a prompt offers:
 
 ## Known behaviors & limitations
 
-- **Ghost dotfiles**: on Linux, the upstream runtime mounts `/dev/null` over
-  non-existent deny paths (e.g. `.env`, `.bashrc`, `.claude`) to block their
-  creation; bwrap creates an empty host file as the mount point for each. These
-  are transient — this plugin calls the runtime's public `cleanupAfterCommand()`
-  after every sandboxed command and the runtime also force-cleans on process
-  exit. The plugin does **not** patch `node_modules` to change this; if you want
-  true prevention (no creation), that requires either patching the runtime or
-  rewriting bwrap args at the plugin level (not done here).
+- **Ghost dotfiles (prevented)**: on Linux, the upstream runtime mounts
+  `/dev/null` over non-existent deny paths (e.g. `.env`, `.bashrc`, `.claude`)
+  to block their creation, which forces bwrap to create empty host mount-point
+  files — leaving ghost dotfiles in the working directory. This is prevented by
+  a **reproducible bun patch** (`patches/@carderne%2Fsandbox-runtime@0.0.49.patch`,
+  registered in `package.json#patchedDependencies`) that makes the runtime skip
+  non-existent deny paths instead of mount-pointing them. `bun install` applies
+  it automatically — no direct `node_modules` editing, and a fresh clone gets
+  the fix. Existing deny paths are still bound read-only. Tradeoff: a sandboxed
+  process could create a previously-non-existent denied path and write to it.
 - **ssh in restricted mode**: bare `ssh` does not honor `ALL_PROXY`, so once
   approved it may still fail to connect under `--unshare-net`. In unrestricted
   (`["*"]`) mode ssh connects natively (host network shared).
