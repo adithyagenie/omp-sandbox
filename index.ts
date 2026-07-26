@@ -732,9 +732,12 @@ function getExtensionHandlerTimeoutBridge(): SetTimeoutBridge {
   const bridge: SetTimeoutBridge = {
     armRunnerTimeout() {
       armedHandlerCount += 1;
-      queueMicrotask(() => {
+      // OMP normally creates the handler timer synchronously, but a deferred
+      // dispatch can create it in a later microtask. Keep this scoped marker
+      // alive through the turn so that timer is still extended.
+      originalSetTimeout(() => {
         armedHandlerCount = Math.max(0, armedHandlerCount - 1);
-      });
+      }, 0);
     },
   };
 
