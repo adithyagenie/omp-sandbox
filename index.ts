@@ -2,15 +2,25 @@
  * Based on https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/examples/extensions/sandbox/index.ts
  * by Mario Zechner, used under the MIT License.
  *
- * Sandbox Extension - OS-level sandboxing for bash commands, plus path policy
- * enforcement for omp's read/write/edit tools, with interactive permission prompts.
+ * Sandbox Extension - OS-level sandboxing for bash commands, hub process
+ * launches, xd:// tool-device subprocesses, plus path policy enforcement for
+ * omp's read/write/edit tools, with interactive permission prompts.
  *
  * Uses @carderne/sandbox-runtime to enforce filesystem and network
- * restrictions on bash commands at the OS level (sandbox-exec on macOS,
- * bubblewrap on Linux). Also intercepts the read, write, and edit tools to
- * apply the same denyRead/denyWrite/allowWrite filesystem rules, which OS-level
- * sandboxing cannot cover (those tools run directly in Node.js, not in a
- * subprocess).
+ * restrictions at the OS level (sandbox-exec on macOS, bubblewrap on Linux).
+ * Three launch surfaces are covered:
+ *   1. bash tool + !bang commands - wrapped via SandboxManager directly.
+ *   2. hub tool op:"start" - the launch spec is rewritten in the tool_call
+ *      handler (application -> shell, args -> ["-c", bwrap-wrapped command]),
+ *      so the broker itself spawns the daemon inside the sandbox.
+ *   3. xd:// device executions (github -> gh, browser -> Chromium) - omp
+ *      spawns those subprocesses in-process via Bun.spawn / child_process.spawn;
+ *      a guarded launch template re-routes them through bwrap while the device
+ *      call is executing. Configured via `sandboxedDevices` (default
+ *      ["github", "browser"]).
+ * Also intercepts the read, write, and edit tools to apply the same
+ * denyRead/denyWrite/allowWrite filesystem rules, which OS-level sandboxing
+ * cannot cover (those tools run directly in Node.js, not in a subprocess).
  *
  * When a block is triggered, the user is prompted to:
  *   (a) Abort (keep blocked)
@@ -74,12 +84,23 @@ import {
 
 interface SandboxConfig extends SandboxRuntimeConfig {
   enabled?: boolean;
+  /** xd:// device names whose subprocess launches run inside the OS sandbox. */
+  sandboxedDevices?: string[];
 }
 
 interface ShellRunResult {
   exitCode: number | null;
   output: string;
 }
+
+/**
+ * xd:// devices whose host subprocesses (spawned in-process by omp while the
+ * device executes) are wrapped in the OS sandbox: github -> gh CLI,
+ * browser -> Chromium via puppeteer. Devices that run their work in separate
+ * worker processes (lsp, eval) or in-process against native code cannot be
+ * covered from an extension.
+ */
+const DEFAULT_SANDBOXED_DEVICES = ["github", "browser"];
 
 const DEFAULT_CONFIG: SandboxConfig = {
   enabled: true,
@@ -104,6 +125,7 @@ const DEFAULT_CONFIG: SandboxConfig = {
     allowWrite: [".", "/tmp"],
     denyWrite: [".env", ".env.*", "*.pem", "*.key"],
   },
+  sandboxedDevices: [...DEFAULT_SANDBOXED_DEVICES],
 };
 
 function loadConfig(cwd: string): SandboxConfig {
@@ -172,6 +194,11 @@ function deepMerge(
           }
         : {}),
     };
+  }
+  if (overrides.sandboxedDevices !== undefined) {
+    result.sandboxedDevices = additive
+      ? unionPaths(base.sandboxedDevices, overrides.sandboxedDevices)
+      : overrides.sandboxedDevices;
   }
 
   const extOverrides = overrides as {
@@ -472,7 +499,9 @@ function collectWriteTargets(toolName: string, input: Record<string, unknown>): 
 
   switch (toolName) {
     case "write":
-      push(input.path);
+      // xd:// paths are the tool-device transport, not filesystem writes;
+      // they are gated by the launch-sandbox device policy instead.
+      if (typeof input.path === "string" && !input.path.startsWith("xd://")) push(input.path);
       break;
     case "edit":
       for (const value of Object.values(input)) {
@@ -591,6 +620,216 @@ function addWritePathToConfig(configPath: string, pathToAdd: string): void {
     config.filesystem = { ...config.filesystem, allowWrite: [...existing, pathToAdd] };
     writeConfigFile(configPath, config);
   }
+}
+
+// ── Launch sandbox guard (hub + xd:// device subprocesses) ───────────────────
+
+/**
+ * Environment variable that carries the payload command for the guarded
+ * launch template. The template (produced by SandboxManager.wrapWithSandbox)
+ * is a fixed bwrap/sandbox-exec wrapper whose innermost command is
+ * `exec <shell> -c "$OMP_SANDBOX_LAUNCH_CMD"`, so arbitrary argv can be
+ * launched synchronously (Bun.spawn / child_process.spawn cannot await an
+ * async wrap) by passing the shell-quoted command through the environment —
+ * no string surgery on the wrapped command, no quoting hazards.
+ */
+const LAUNCH_CMD_VAR = "OMP_SANDBOX_LAUNCH_CMD";
+
+/** Windows older than this are dropped (guards against lost tool_result events). */
+const LAUNCH_WINDOW_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * Host utilities omp may spawn incidentally while a device call is executing
+ * (clipboard helpers, URL opening, sandbox plumbing). Wrapping these would
+ * break unrelated session features for no containment gain.
+ */
+const INFRA_SPAWN_BASENAMES: Record<string, true> = {
+  bwrap: true,
+  socat: true,
+  "apply-seccomp": true,
+  "xdg-open": true,
+  xclip: true,
+  "wl-copy": true,
+  "wl-paste": true,
+  pbcopy: true,
+  pbpaste: true,
+  osascript: true,
+  "termux-clipboard-set": true,
+  getconf: true,
+  wslpath: true,
+  "powershell.exe": true,
+};
+/** Quote one shell word (POSIX single-quote convention). */
+function shellQuoteArg(arg: string): string {
+  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(arg)) return arg;
+  return `'${arg.replace(/'/g, `'\\''`)}'`;
+}
+
+/** Quote an argv into a single shell command string. */
+function shellQuoteJoin(argv: string[]): string {
+  return argv.map(shellQuoteArg).join(" ");
+}
+
+interface LaunchTemplate {
+  generation: number;
+  wrapped: string;
+}
+
+/**
+ * Process-global state for the launch guard. omp core and the extension share
+ * one process, and subagent sessions re-bind the same prepared extension, so
+ * module state suffices; the Symbol.for key survives plugin reloads. The
+ * patched spawn functions close over this object; the extension updates the
+ * accessors as the sandbox is initialized, reconfigured, or disabled.
+ */
+interface LaunchGuardState {
+  installed: boolean;
+  nesting: number;
+  activeCalls: Map<string, number>;
+  template: LaunchTemplate | null;
+  bashPath: string;
+  isEnabled: () => boolean;
+  note: (message: string) => void;
+}
+
+const LAUNCH_GUARD_KEY = Symbol.for("pi-sandbox-omp.launchGuard");
+
+interface GlobalWithLaunchGuard {
+  [LAUNCH_GUARD_KEY]?: LaunchGuardState;
+}
+
+function getLaunchGuardState(): LaunchGuardState {
+  const global = globalThis as typeof globalThis & GlobalWithLaunchGuard;
+  const existing = global[LAUNCH_GUARD_KEY];
+  if (existing) return existing;
+  const state: LaunchGuardState = {
+    installed: false,
+    nesting: 0,
+    activeCalls: new Map(),
+    template: null,
+    bashPath: "/bin/bash",
+    isEnabled: () => false,
+    note: () => {},
+  };
+  global[LAUNCH_GUARD_KEY] = state;
+  return state;
+}
+
+function launchWindowActive(state: LaunchGuardState): boolean {
+  const now = Date.now();
+  for (const [id, openedAt] of state.activeCalls) {
+    if (now - openedAt > LAUNCH_WINDOW_TTL_MS) state.activeCalls.delete(id);
+  }
+  return state.activeCalls.size > 0;
+}
+
+function isInfraSpawn(exe: string): boolean {
+  // omp worker processes (daemon broker, LSP mux, ...) communicate over IPC or
+  // shared sockets; wrapping them would break session infrastructure. The
+  // guarded launcher itself calls the original spawn directly, so shell
+  // binaries must NOT be skipped here — a device spawning a shell is a
+  // workload, and skipping it would open an escape hatch.
+  if (exe === process.execPath) return true;
+  return INFRA_SPAWN_BASENAMES[basename(exe)] === true;
+}
+
+/**
+ * Decide whether a spawn should be re-routed through the sandbox template.
+ * Returns the replacement [bash, -c, template] spawn, or null to leave the
+ * spawn untouched. Throws when a sandboxed-context spawn arrives with no
+ * usable template (fail closed — the error surfaces in the tool result).
+ */
+function transformGuardedLaunch(
+  state: LaunchGuardState,
+  cmd: string | string[],
+  opts: Record<string, unknown> | undefined,
+): { cmd: string[]; opts: Record<string, unknown> } | null {
+  if (state.nesting > 0 || !state.isEnabled() || !launchWindowActive(state)) return null;
+  // IPC workers (omp infrastructure) communicate over a dedicated channel;
+  // a shell intermediary would sever it.
+  if (opts && ("ipc" in opts) && opts.ipc !== undefined && opts.ipc !== null) return null;
+
+  const commandText = typeof cmd === "string" ? cmd : shellQuoteJoin(cmd);
+  if (commandText.length === 0) return null;
+  const exe = typeof cmd === "string" ? cmd.split(/\s+/)[0] ?? "" : cmd[0];
+  if (!exe || isInfraSpawn(exe)) return null;
+
+  const template = state.template;
+  if (!template) {
+    throw new Error(
+      `[pi-sandbox-omp] sandboxed launch requested but the bwrap template is not ready; retry the tool call`,
+    );
+  }
+
+  const optsEnv = opts?.env;
+  const baseEnv: Record<string, string | undefined> =
+    typeof optsEnv === "object" && optsEnv !== null ? optsEnv : process.env;
+  const env = {
+    ...baseEnv,
+    [LAUNCH_CMD_VAR]: commandText,
+  };
+  return {
+    cmd: [state.bashPath, "-c", template.wrapped],
+    opts: { ...opts, env },
+  };
+}
+
+/**
+ * Patch the two in-process spawn surfaces omp uses for tool-device
+ * subprocesses:
+ *   - Bun.spawn            — global lookup at call time (xd://github gh CLI, MCP, ...)
+ *   - child_process.spawn  — default-import surface (puppeteer/Chromium for xd://browser)
+ * Named-import bindings (sandbox-runtime's socat bridges, this plugin's own
+ * runner) resolved at module link time and are unaffected — no recursion.
+ */
+function installLaunchSandboxGuard(state: LaunchGuardState): void {
+  type SpawnFn = (this: unknown, cmdOrOpts: unknown, maybeOpts?: unknown) => unknown;
+  const bunGlobal = globalThis as typeof globalThis & { Bun?: { spawn?: unknown } };
+  const bun = bunGlobal.Bun;
+  if (bun && typeof bun.spawn === "function") {
+    const original = bun.spawn as SpawnFn;
+    const guarded = function (this: unknown, cmdOrOpts: unknown, maybeOpts?: unknown) {
+      // Bun.spawn accepts (cmd, opts) or a single options object with .cmd.
+      if (cmdOrOpts !== null && typeof cmdOrOpts === "object" && !Array.isArray(cmdOrOpts)) {
+        const opts = cmdOrOpts as Record<string, unknown>;
+        const cmd = opts.cmd;
+        if (typeof cmd !== "string" && !Array.isArray(cmd)) {
+          return original.call(bun, cmdOrOpts, maybeOpts);
+        }
+        const transformed = transformGuardedLaunch(state, cmd, opts);
+        if (!transformed) return original.call(bun, cmdOrOpts, maybeOpts);
+        return original.call(bun, { ...opts, cmd: transformed.cmd, env: transformed.opts.env });
+      }
+      if (typeof cmdOrOpts !== "string" && !Array.isArray(cmdOrOpts)) {
+        return original.call(bun, cmdOrOpts, maybeOpts);
+      }
+      const opts =
+        maybeOpts !== null && typeof maybeOpts === "object"
+          ? (maybeOpts as Record<string, unknown>)
+          : undefined;
+      const transformed = transformGuardedLaunch(state, cmdOrOpts, opts);
+      if (!transformed) return original.call(bun, cmdOrOpts, maybeOpts);
+      return original.call(bun, transformed.cmd, transformed.opts);
+    };
+    bun.spawn = guarded;
+  }
+
+  type NodeCpModule = {
+    spawn: (this: unknown, file: string, args?: string[], opts?: unknown) => unknown;
+  };
+  const nodeCp = require("node:child_process") as NodeCpModule;
+  const originalSpawn = nodeCp.spawn.bind(nodeCp);
+  nodeCp.spawn = function (this: unknown, file: string, args?: string[], opts?: unknown) {
+    if (typeof file !== "string" || file.length === 0) {
+      return originalSpawn(file, args, opts);
+    }
+    const argv = args === undefined ? [file] : [file, ...args];
+    const optsRecord =
+      opts !== null && typeof opts === "object" ? (opts as Record<string, unknown>) : undefined;
+    const transformed = transformGuardedLaunch(state, argv, optsRecord);
+    if (!transformed) return originalSpawn(file, args, opts);
+    return originalSpawn(transformed.cmd[0], transformed.cmd.slice(1), transformed.opts);
+  };
 }
 
 // ── Shell runner ──────────────────────────────────────────────────────────────
@@ -804,6 +1043,57 @@ export default function (pi: ExtensionAPI) {
   const sessionAllowedReadPaths: string[] = [];
   const sessionAllowedWritePaths: string[] = [];
 
+  // ── Launch sandbox (hub + xd:// device subprocesses) ──────────────────────
+
+  const launchGuard = getLaunchGuardState();
+  // Bumped whenever the sandbox config changes so the guarded-launch template
+  // (bwrap argv baked once, reused synchronously at spawn time) is rebuilt.
+  let launchTemplateGeneration = 0;
+  let launchTemplatePromise: Promise<string> | null = null;
+
+  function getEffectiveSandboxedDevices(cwd: string): Set<string> {
+    return new Set(loadConfig(cwd).sandboxedDevices ?? DEFAULT_SANDBOXED_DEVICES);
+  }
+
+  /**
+   * Build (or reuse) the guarded-launch template: a fixed wrapped command
+   * whose payload rides in $OMP_SANDBOX_LAUNCH_CMD. Computed async here, then
+   * available synchronously to the patched Bun.spawn / child_process.spawn.
+   */
+  function ensureLaunchTemplate(): Promise<string> {
+    if (launchGuard.template && launchGuard.template.generation === launchTemplateGeneration) {
+      return Promise.resolve(launchGuard.template.wrapped);
+    }
+    if (!launchTemplatePromise) {
+      const generation = launchTemplateGeneration;
+      launchTemplatePromise = SandboxManager.wrapWithSandbox(
+        `exec ${shellQuoteArg(bashShellPath())} -c "$${LAUNCH_CMD_VAR}"`,
+        bashShellPath(),
+      )
+        .then((wrapped) => {
+          launchGuard.template = { generation, wrapped };
+          return wrapped;
+        })
+        .catch((err: unknown) => {
+          launchTemplatePromise = null;
+          throw err;
+        });
+    }
+    return launchTemplatePromise;
+  }
+
+  function configureLaunchGuard(note: (message: string) => void): void {
+    launchGuard.bashPath = bashShellPath();
+    launchGuard.isEnabled = () => sandboxEnabled && sandboxInitialized;
+    launchGuard.note = note;
+    installLaunchSandboxGuard(launchGuard);
+    // Warm the template in the background so the first sandboxed device call
+    // does not pay the wrap cost (rg deny-path scans, proxy check) up front.
+    ensureLaunchTemplate().catch((err: unknown) => {
+      note(`Warning: failed to build launch sandbox template: ${err instanceof Error ? err.message : err}`);
+    });
+  }
+
   // ── Effective config helpers ────────────────────────────────────────────────
 
   function getEffectiveAllowedDomains(cwd: string): string[] {
@@ -853,6 +1143,10 @@ export default function (pi: ExtensionAPI) {
         allowBrowserProcess: configExt.allowBrowserProcess,
         enableWeakerNetworkIsolation: true,
       });
+      // Filesystem/network rules changed — the baked launch template must be
+      // rebuilt on next use.
+      launchTemplateGeneration++;
+      launchTemplatePromise = null;
     } catch (e) {
       console.error(`Warning: Failed to reinitialize sandbox: ${e}`);
     }
@@ -1247,7 +1541,95 @@ export default function (pi: ExtensionAPI) {
     };
   }));
 
-  // ── tool_call — network pre-check for bash, path policy for read/write/edit
+  // ── tool_call — network pre-check for bash/hub, launch wrapping, path policy
+
+  /**
+   * Domain + ssh pre-check shared by the bash tool and hub launches: prompts
+   * for domains outside allowedDomains and confirms ssh-family targets.
+   * Returns a block result, or undefined when the command may proceed.
+   */
+  async function enforceNetworkAndSshGate(
+    command: string,
+    ctx: ExtensionContext,
+  ): Promise<{ block: true; reason: string } | undefined> {
+    const effectiveDomains = getEffectiveAllowedDomains(ctx.cwd);
+    for (const domain of extractDomainsFromCommand(command)) {
+      if (domainIsAllowed(domain, effectiveDomains)) continue;
+      const choice = await promptDomainBlock(ctx, domain);
+      if (choice === "abort") {
+        return {
+          block: true,
+          reason: `Network access to "${domain}" is blocked (not in allowedDomains).`,
+        };
+      }
+      await applyDomainChoice(choice, domain, ctx.cwd);
+    }
+    const sshBlockedHost = await enforceSshGate(command, ctx);
+    if (sshBlockedHost) {
+      return {
+        block: true,
+        reason: `Sandbox: SSH to "${sshBlockedHost}" requires confirmation.`,
+      };
+    }
+    return undefined;
+  }
+
+  /**
+   * Rewrite a hub op:"start" launch so the daemon broker itself spawns the
+   * process inside the OS sandbox: application -> shell, args -> bwrap-wrapped
+   * command. The rewritten spec passes the hub tool's own schema validation,
+   * and the broker's records/logs/stop/restart keep working unchanged.
+   */
+  async function wrapHubLaunch(
+    input: {
+      application: string;
+      args?: string[];
+      ready?: { port?: number };
+      detached?: boolean;
+      persist?: boolean;
+      [key: string]: unknown;
+    },
+    ctx: ExtensionContext,
+    config: SandboxConfig,
+  ): Promise<{ input: Record<string, unknown> } | { block: true; reason: string }> {
+    const argv = [input.application, ...(input.args ?? [])];
+    const gate = await enforceNetworkAndSshGate(argv.join(" "), ctx);
+    if (gate) return gate;
+
+    let wrapped: string;
+    try {
+      wrapped = await SandboxManager.wrapWithSandbox(shellQuoteJoin(argv), bashShellPath());
+    } catch (err) {
+      return {
+        block: true,
+        reason: `Sandbox: failed to wrap hub launch in the OS sandbox: ${err instanceof Error ? err.message : err}`,
+      };
+    }
+
+    if (input.ready?.port !== undefined && !isUnrestrictedNetwork(config.network)) {
+      ctx.ui.notify(
+        `⚠️ Sandbox network isolation is on: daemon "${String(input.name)}" listens inside the sandbox namespace, ` +
+          `so ready.port ${input.ready.port} will not accept host connections and readiness will time out. ` +
+          `Use ready.log, or allow "*" with no deniedDomains to share the host network.`,
+        "warning",
+      );
+    }
+    if (input.detached || input.persist) {
+      ctx.ui.notify(
+        `⚠️ Sandboxed daemons are tied to the broker's lifetime (bubblewrap --die-with-parent): ` +
+          `"${String(input.name)}" will not survive broker shutdown despite ${input.detached ? "detached" : "persist"}.`,
+        "warning",
+      );
+    }
+
+    return {
+      input: {
+        ...input,
+        application: bashShellPath(),
+        args: ["-c", wrapped],
+      },
+    };
+  }
 
   pi.on("tool_call", withExtensionHandlerTimeoutBridge(timeoutBridge, async (event, ctx) => {
     if (!sandboxEnabled) return;
@@ -1259,28 +1641,31 @@ export default function (pi: ExtensionAPI) {
 
     // Network pre-check for bash tool calls.
     if (sandboxInitialized && isToolCallEventType("bash", event)) {
-      const domains = extractDomainsFromCommand(event.input.command);
-      const effectiveDomains = getEffectiveAllowedDomains(ctx.cwd);
-      for (const domain of domains) {
-        if (!domainIsAllowed(domain, effectiveDomains)) {
-          const choice = await promptDomainBlock(ctx, domain);
-          if (choice === "abort") {
-            return {
-              block: true,
-              reason: `Network access to "${domain}" is blocked (not in allowedDomains).`,
-            };
-          }
-          await applyDomainChoice(choice, domain, ctx.cwd);
-        }
-      }
-      const sshBlockedHost = await enforceSshGate(event.input.command, ctx);
-      if (sshBlockedHost) {
-        return {
-          block: true,
-          reason: `Sandbox: SSH to "${sshBlockedHost}" requires confirmation.`,
-        };
+      const gate = await enforceNetworkAndSshGate(event.input.command, ctx);
+      if (gate) return gate;
+    }
+
+    // Hub launches: rewrite the daemon spec so the broker spawns it inside
+    // the OS sandbox (same filesystem/network policy as bash).
+    if (sandboxInitialized && isToolCallEventType("hub", event)) {
+      const hubInput = event.input as {
+        op?: string;
+        application?: string;
+        args?: string[];
+      };
+      if (hubInput.op === "start" && typeof hubInput.application === "string" && hubInput.application.length > 0) {
+        return await wrapHubLaunch(
+          {
+            ...(event.input as Record<string, unknown>),
+            application: hubInput.application,
+            args: Array.isArray(hubInput.args) ? hubInput.args.map(String) : [],
+          },
+          ctx,
+          config,
+        );
       }
     }
+
 
     // Path policy: read tool.
     //   - If the path is already in effectiveAllowRead, allow silently.
@@ -1343,6 +1728,36 @@ export default function (pi: ExtensionAPI) {
         }
       }
     }
+
+    // xd:// device executions: omp spawns the device's host subprocesses
+    // (github -> gh CLI, browser -> Chromium) in-process while the call runs.
+    // Open a launch window so the patched Bun.spawn / child_process.spawn
+    // re-route them through the sandbox template; tool_result closes it.
+    if (sandboxInitialized && isToolCallEventType("write", event)) {
+      const writeInput = event.input as { path?: unknown };
+      if (typeof writeInput.path === "string" && writeInput.path.startsWith("xd://")) {
+        const device = writeInput.path.slice("xd://".length).split("/")[0];
+        if (device && getEffectiveSandboxedDevices(ctx.cwd).has(device)) {
+          try {
+            await ensureLaunchTemplate();
+          } catch (err) {
+            return {
+              block: true,
+              reason:
+                `Sandbox: failed to prepare the OS sandbox for xd://${device} launches: ` +
+                `${err instanceof Error ? err.message : err}. Retry the tool call.`,
+            };
+          }
+          launchGuard.activeCalls.set(event.toolCallId, Date.now());
+        }
+      }
+    }
+  }));
+
+  // ── tool_result — close launch windows ──────────────────────────────────────
+
+  pi.on("tool_result", withExtensionHandlerTimeoutBridge(timeoutBridge, async (event) => {
+    launchGuard.activeCalls.delete(event.toolCallId);
   }));
 
   // ── session_start ───────────────────────────────────────────────────────────
@@ -1403,6 +1818,9 @@ export default function (pi: ExtensionAPI) {
 
       sandboxEnabled = true;
       sandboxInitialized = true;
+      launchTemplateGeneration++;
+      launchTemplatePromise = null;
+      configureLaunchGuard((message) => console.error(message));
 
       warnIfAllDomainsAllowed(ctx, config);
 
@@ -1424,6 +1842,7 @@ export default function (pi: ExtensionAPI) {
   // ── session_shutdown ────────────────────────────────────────────────────────
 
   pi.on("session_shutdown", async () => {
+    launchGuard.activeCalls.clear();
     if (sandboxInitialized) {
       try {
         await SandboxManager.reset();
@@ -1471,9 +1890,12 @@ export default function (pi: ExtensionAPI) {
 
         sandboxEnabled = true;
         sandboxInitialized = true;
+        launchTemplateGeneration++;
+        launchTemplatePromise = null;
+        configureLaunchGuard(ctx.cwd, (message) => ctx.ui.notify(message, "warning"));
 
         warnIfAllDomainsAllowed(ctx, config);
-
+        configureLaunchGuard((message) => ctx.ui.notify(message, "warning"));
         const networkLabel = formatNetworkLabel(config.network);
         const writeCount = config.filesystem?.allowWrite?.length ?? 0;
         ctx.ui.setStatus(
@@ -1553,9 +1975,18 @@ export default function (pi: ExtensionAPI) {
           ? [`  Session write: ${sessionAllowedWritePaths.join(", ")}`]
           : []),
         "",
+        "Launches (hub op:\"start\" + xd:// devices):",
+        `  Sandboxed devices: ${(config.sandboxedDevices ?? DEFAULT_SANDBOXED_DEVICES).join(", ")}`,
+        "  hub start launches are rewritten to run inside the OS sandbox.",
+        ...(launchGuard.activeCalls.size > 0
+          ? [`  Active sandboxed device calls: ${launchGuard.activeCalls.size}`]
+          : []),
+        "",
         "Note: ALL reads are prompted unless the path is already in allowRead.",
         "Note: denyRead is not a hard-block — granting a prompt adds to allowRead, overriding denyRead.",
         "Note: denyWrite takes PRECEDENCE over allowWrite and is never prompted.",
+        "Note: hub daemons started before the sandbox was enabled (or restarted from a pre-sandbox spec) run unsandboxed.",
+        "Note: lsp/eval devices run in separate worker processes and are not launch-sandboxed.",
       ];
       ctx.ui.notify(lines.join("\n"), "info");
     },

@@ -20,6 +20,9 @@ confirmation gate.
 - **Network policy** — per-domain allow/deny rules with interactive approvals.
 - **SSH gate** — detects `ssh`, `scp`, `sftp`, remote `rsync`, and ssh-based
   `git clone`; each target host requires explicit approval.
+- **Launch sandboxing** — `hub` process launches (`op:"start"`) and `xd://`
+  tool-device subprocesses (github's `gh`, the browser's Chromium) run inside
+  the same OS sandbox as bash.
 - **Scoped approvals** — allow once for the session, project, or all projects.
 - **OMP-native paths** — configuration and runtime paths use `.omp`.
 
@@ -84,8 +87,41 @@ and are deduplicated.
     "allowRead": [".", "~/.config"],
     "allowWrite": [".", "/tmp"],
     "denyWrite": [".env", ".env.*", "*.pem", "*.key"]
-  }
+  },
+  "sandboxedDevices": ["github", "browser"]
 }
+```
+
+### Launch sandboxing (hub + xd://)
+
+The sandbox covers three launch surfaces. bash and `!cmd` are wrapped
+directly; the other two are new:
+
+- **`hub` `op:"start"`** — the launch spec is rewritten before it reaches the
+  daemon broker (`application` becomes the sandbox shell, `args` becomes the
+  bwrap-wrapped command), so the broker itself spawns the daemon inside the
+  sandbox. Broker records, logs, `ps`/`stop`/`restart` keep working. The
+  command gets the same domain/ssh pre-checks as bash. Caveats:
+  - Daemons started before the sandbox was enabled — and `restart` of one —
+    reuse the broker's stored (unwrapped) spec and stay unsandboxed.
+  - With network isolation on, a daemon's listening ports live inside the
+    sandbox namespace: `ready.port` will not accept host connections (the
+    plugin warns and suggests `ready.log` or the unrestricted network mode).
+  - `persist`/`detached` daemons are tied to the broker's lifetime
+    (bubblewrap `--die-with-parent`) and will not survive broker shutdown;
+    the plugin warns when this applies.
+- **`xd://` tool devices** — omp spawns some device subprocesses in-process
+  (`xd://github` runs `gh`; `xd://browser` launches Chromium). While such a
+  device call executes, omp's `Bun.spawn` / `child_process.spawn` are patched
+  to route spawns through a pre-built bwrap template (the payload command
+  travels in `OMP_SANDBOX_LAUNCH_CMD` so no quoting surgery is needed).
+  The device list is `sandboxedDevices` (default `["github", "browser"]`,
+  unioned across config scopes). Not coverable from an extension: `lsp`
+  (language servers spawn in a separate worker) and `eval` (in-process
+  kernel) — keep those gated via `tools.approval` if needed.
+
+  If the template cannot be built (bwrap/socat failure), the device call is
+  blocked with an error rather than run unsandboxed.
 ```
 
 ### Network modes
