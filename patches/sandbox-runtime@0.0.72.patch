@@ -1,0 +1,27 @@
+diff --git a/dist/sandbox/sandbox-utils.js b/dist/sandbox/sandbox-utils.js
+index a724be479a1e47facc5069003d2cdc05624ff765..20211cbd8bcf7ff90c542a658fe787aa3d48b471 100644
+--- a/dist/sandbox/sandbox-utils.js
++++ b/dist/sandbox/sandbox-utils.js
+@@ -21,7 +21,7 @@ export const DANGEROUS_FILES = [
+  * Dangerous directories that should be protected from writes.
+  * These directories contain sensitive configuration or executable files.
+  */
+-export const DANGEROUS_DIRECTORIES = [];
++export const DANGEROUS_DIRECTORIES = ['.omp'];
+ /**
+  * Get the list of dangerous directories to deny writes to.
+  */
+@@ -314,10 +314,10 @@ export function getDefaultWritePaths() {
+         '/dev/tty',
+         '/dev/dtracehelper',
+         '/dev/autofs_nowait',
+-        '/tmp/claude',
+-        '/private/tmp/claude',
++        '/tmp/omp',
++        '/private/tmp/omp',
+         path.join(homeDir, '.npm/_logs'),
+-        path.join(homeDir, '.claude/debug'),
++        path.join(homeDir, '.omp/debug'),
+     ];
+     return recommendedPaths;
+ }
