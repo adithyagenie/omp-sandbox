@@ -411,8 +411,8 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
         if (block) return block;
         continue;
       }
-      const path = canonicalizePath(target.path);
-      const decision = decidePath(ruleLayersForTool(loaded, tool, shared.session).read, path, ctx.cwd, true);
+      const path = canonicalizePath(target.path, ctx.cwd);
+      const decision = decidePath(ruleLayersForTool(loaded, tool, shared.session).read, target.path, ctx.cwd, true);
       if (decision === "deny") return { block: true, reason: `Sandbox: read access denied for "${path}" (denied by policy).` };
       if (decision === "prompt") {
         const choice = await askChoice(ctx, (routed) => promptReadBlock(routed, path));
@@ -429,8 +429,8 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
         if (block) return block;
         continue;
       }
-      const path = canonicalizePath(target.path);
-      const decision = decidePath(ruleLayersForTool(loaded, tool, shared.session).write, path, ctx.cwd);
+      const path = canonicalizePath(target.path, ctx.cwd);
+      const decision = decidePath(ruleLayersForTool(loaded, tool, shared.session).write, target.path, ctx.cwd);
       if (decision === "deny") return { block: true, reason: `Sandbox: write access denied for "${path}" (denied by policy).` };
       if (decision === "prompt") {
         const choice = await askChoice(ctx, (routed) => promptWriteBlock(routed, path));

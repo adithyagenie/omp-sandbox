@@ -1,7 +1,8 @@
 import type { SandboxRuntimeConfig } from "@carderne/sandbox-runtime";
-import { existsSync, realpathSync } from "node:fs";
+import type { PathRuleScope, SandboxConfig } from "./config.ts";
+import { existsSync, lstatSync, readlinkSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, resolve } from "node:path";
+import { basename, dirname, isAbsolute, parse, resolve, sep } from "node:path";
 
 export function extractDomainsFromCommand(command: string): string[] {
   const urlRegex = /https?:\/\/([a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g;
@@ -179,43 +180,187 @@ export function extractBlockedWritePath(output: string): string | null {
   return match ? match[1] : null;
 }
 
-export function expandPath(filePath: string): string {
-  return resolve(filePath.replace(/^~(?=$|\/)/, homedir()));
+function isHomePath(filePath: string): boolean {
+  return /^~(?=$|[\\/])/.test(filePath);
 }
 
-export function canonicalizePath(filePath: string): string {
-  const absolute = expandPath(filePath);
-  try {
-    return realpathSync.native(absolute);
-  } catch {
-    const tail: string[] = [];
-    let probe = absolute;
-    while (!existsSync(probe)) {
-      const parent = dirname(probe);
-      if (parent === probe) return absolute;
-      tail.unshift(basename(probe));
-      probe = parent;
+function absolutePathPreservingTraversal(filePath: string, cwd = process.cwd()): string {
+  if (isHomePath(filePath)) return homedir() + filePath.slice(1);
+  if (process.platform === "win32" && /^[\\/](?![\\/])/.test(filePath)) {
+    return parse(resolve(cwd)).root + filePath.replace(/^[\\/]+/, "");
+  }
+  if (isAbsolute(filePath)) return filePath;
+  if (process.platform === "win32" && /^[A-Za-z]:/.test(filePath)) {
+    const cwdRoot = parse(resolve(cwd)).root;
+    if (cwdRoot.slice(0, 2).toLowerCase() !== filePath.slice(0, 2).toLowerCase()) return resolve(filePath);
+    filePath = filePath.slice(2);
+  }
+  const base = isAbsolute(cwd) ? cwd : resolve(cwd);
+  return base.endsWith(sep) ? base + filePath : base + sep + filePath;
+}
+
+export function expandPath(filePath: string): string {
+  return resolve(filePath.replace(/^~(?=$|[\\/])/, homedir()));
+}
+
+function splitPathComponents(filePath: string): string[] {
+  return process.platform === "win32"
+    ? filePath.split(/[\\/]+/)
+    : filePath.split("/");
+}
+
+function canonicalizeAbsolutePath(absolute: string): string {
+  const initialRoot = parse(absolute).root;
+  let resolved = initialRoot;
+  let pending = splitPathComponents(absolute.slice(initialRoot.length));
+  let symlinkDepth = 0;
+  while (pending.length > 0) {
+    const component = pending.shift();
+    if (!component || component === ".") continue;
+    if (component === "..") {
+      resolved = dirname(resolved);
+      continue;
     }
+    const candidate = resolved.endsWith(sep) ? resolved + component : resolved + sep + component;
     try {
-      return resolve(realpathSync.native(probe), ...tail);
+      if (!lstatSync(candidate).isSymbolicLink()) {
+        resolved = candidate;
+        continue;
+      }
+      if (symlinkDepth++ >= 40) return absolute;
+      const link = readlinkSync(candidate);
+      const target = isAbsolute(link)
+        ? link
+        : dirname(candidate) + (dirname(candidate).endsWith(sep) ? "" : sep) + link;
+      const targetRoot = parse(target).root;
+      resolved = targetRoot;
+      pending = [...splitPathComponents(target.slice(targetRoot.length)), ...pending];
     } catch {
-      return absolute;
+      resolved = candidate;
     }
   }
+  return resolved;
+}
+
+export function canonicalizePath(filePath: string, cwd = process.cwd()): string {
+  return canonicalizeAbsolutePath(absolutePathPreservingTraversal(filePath, cwd));
+}
+function canonicalizePattern(pattern: string): string {
+  const raw = absolutePathPreservingTraversal(pattern);
+  const expanded = process.platform === "win32" ? raw.replace(/\//g, sep) : raw;
+  const wildcardIndex = expanded.indexOf("*");
+  if (wildcardIndex < 0) return canonicalizePath(expanded);
+  const boundary = expanded.lastIndexOf(sep, wildcardIndex);
+  if (boundary < 0) return expanded;
+  const literalDirectory = expanded.slice(0, boundary + 1);
+  const canonicalDirectory = canonicalizePath(literalDirectory);
+  const suffix = expanded.slice(boundary + 1);
+  return canonicalDirectory.endsWith(sep)
+    ? canonicalDirectory + suffix
+    : canonicalDirectory + sep + suffix;
+}
+
+function comparablePath(filePath: string, insensitive: boolean): string {
+  return insensitive ? filePath.toLowerCase() : filePath;
+}
+
+function matchesResolvedPattern(filePath: string, pattern: string, insensitive = false): boolean {
+  const candidatePath = comparablePath(filePath, insensitive);
+  const candidatePattern = comparablePath(pattern, insensitive);
+  if (candidatePattern.includes("*")) {
+    const escaped = candidatePattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+    return new RegExp(`^${escaped}$`).test(candidatePath);
+  }
+  const separator = candidatePattern.endsWith(sep) ? "" : sep;
+  return candidatePath === candidatePattern || candidatePath.startsWith(candidatePattern + separator);
 }
 
 export function matchesPattern(filePath: string, patterns: string[], exactWildcardMatchesAll = false): boolean {
   const absolute = canonicalizePath(filePath);
-  return patterns.some((pattern) => {
-    if (pattern === "*" && exactWildcardMatchesAll) return true;
-    const candidate = pattern.includes("*") ? expandPath(pattern) : canonicalizePath(pattern);
-    if (pattern.includes("*")) {
-      const escaped = candidate.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
-      return new RegExp(`^${escaped}$`).test(absolute);
+  return patterns.some((pattern) =>
+    pattern === "*" && exactWildcardMatchesAll
+      ? true
+      : matchesResolvedPattern(absolute, canonicalizePattern(pattern)),
+  );
+}
+type PathSpecificity = readonly [depth: number, literalLength: number, kind: number];
+
+function compareSpecificity(left: PathSpecificity, right: PathSpecificity): number {
+  for (let index = 0; index < left.length; index++) {
+    const difference = left[index] - right[index];
+    if (difference !== 0) return difference;
+  }
+  return 0;
+}
+
+function pathDepth(filePath: string): number {
+  return splitPathComponents(filePath).filter(Boolean).length;
+}
+
+function specificityForCandidate(
+  canonicalPath: string,
+  candidate: string,
+  insensitive: boolean,
+): PathSpecificity {
+  const wildcardIndex = candidate.indexOf("*");
+  if (wildcardIndex >= 0) {
+    const literalPrefix = candidate.slice(0, wildcardIndex);
+    return [pathDepth(literalPrefix), literalPrefix.length, 2];
+  }
+  return [
+    pathDepth(candidate),
+    candidate.length,
+    comparablePath(canonicalPath, insensitive) === comparablePath(candidate, insensitive) ? 3 : 1,
+  ];
+}
+
+function matchSpecificity(
+  canonicalPath: string,
+  lexicalPath: string,
+  pattern: string,
+  canonicalCwd: string,
+  exactWildcardMatchesAll: boolean,
+  matchLexicalPath: boolean,
+): PathSpecificity | null {
+  if (pattern === "*" && exactWildcardMatchesAll) return [0, 0, 0];
+  const resolvedPattern = absolutePathPreservingTraversal(pattern, canonicalCwd);
+  const canonicalPattern = canonicalizePattern(resolvedPattern);
+  const insensitiveDeny = matchLexicalPath &&
+    (process.platform === "win32" || process.platform === "darwin");
+  let best = matchesResolvedPattern(canonicalPath, canonicalPattern, insensitiveDeny)
+    ? specificityForCandidate(canonicalPath, canonicalPattern, insensitiveDeny)
+    : null;
+  if (matchLexicalPath) {
+    const lexicalPattern = absolutePathPreservingTraversal(resolvedPattern, canonicalCwd);
+    if (matchesResolvedPattern(lexicalPath, lexicalPattern, insensitiveDeny)) {
+      const lexical = specificityForCandidate(lexicalPath, lexicalPattern, insensitiveDeny);
+      if (!best || compareSpecificity(lexical, best) > 0) best = lexical;
     }
-    const separator = candidate.endsWith("/") ? "" : "/";
-    return absolute === candidate || absolute.startsWith(candidate + separator);
-  });
+  }
+  return best;
+}
+
+function bestSpecificity(
+  canonicalPath: string,
+  lexicalPath: string,
+  patterns: string[],
+  canonicalCwd: string,
+  exactWildcardMatchesAll: boolean,
+  matchLexicalPath: boolean,
+): PathSpecificity | null {
+  let best: PathSpecificity | null = null;
+  for (const pattern of patterns) {
+    const specificity = matchSpecificity(
+      canonicalPath,
+      lexicalPath,
+      pattern,
+      canonicalCwd,
+      exactWildcardMatchesAll,
+      matchLexicalPath,
+    );
+    if (specificity && (!best || compareSpecificity(specificity, best) > 0)) best = specificity;
+  }
+  return best;
 }
 
 export type ClassifiedPath =
@@ -290,30 +435,33 @@ export type PolicyDecision = "allow" | "deny" | "prompt";
 export type PolicyRuleLayer = { list: string[]; effect: "allow" | "deny" };
 
 export function decidePath(
-  layers: PolicyRuleLayer[],
+  scopes: PathRuleScope[],
   absolutePath: string,
   cwd: string,
-  exactWildcardMatchesAll = false,
+  exactAllowWildcardMatchesAll = false,
 ): PolicyDecision {
-  const canonicalCwd = canonicalizePath(cwd);
-  const canonicalPath = canonicalizePath(absolutePath);
-  for (const layer of layers) {
-    const wildcardMatchesAll = exactWildcardMatchesAll && layer.effect === "allow";
-    const patterns = layer.list.map((pattern) =>
-      pattern === "*" && wildcardMatchesAll
-        ? pattern
-        : pattern.startsWith("~") || isAbsolute(pattern)
-          ? pattern
-          : resolve(canonicalCwd, pattern),
+  const lexicalCwd = absolutePathPreservingTraversal(cwd);
+  const canonicalCwd = canonicalizePath(lexicalCwd);
+  const lexicalPath = absolutePathPreservingTraversal(absolutePath, lexicalCwd);
+  const canonicalPath = canonicalizePath(lexicalPath);
+  for (const scope of scopes) {
+    const allow = bestSpecificity(
+      canonicalPath,
+      lexicalPath,
+      scope.allow,
+      lexicalCwd,
+      exactAllowWildcardMatchesAll,
+      false,
     );
-    if (matchesPattern(canonicalPath, patterns, wildcardMatchesAll)) return layer.effect;
+    const deny = bestSpecificity(canonicalPath, lexicalPath, scope.deny, lexicalCwd, false, true);
+    if (!allow && !deny) continue;
+    if (deny && (!allow || compareSpecificity(deny, allow) >= 0)) return "deny";
+    return "allow";
   }
   const canonicalTmp = canonicalizePath("/tmp");
   const implicitlyAllowed =
-    canonicalPath === canonicalCwd ||
-    canonicalPath.startsWith(canonicalCwd + "/") ||
-    canonicalPath === canonicalTmp ||
-    canonicalPath.startsWith(canonicalTmp + "/");
+    matchesResolvedPattern(canonicalPath, canonicalCwd) ||
+    matchesResolvedPattern(canonicalPath, canonicalTmp);
   return implicitlyAllowed ? "allow" : "prompt";
 }
 

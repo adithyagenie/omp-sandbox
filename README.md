@@ -85,20 +85,18 @@ Configuration lives at `~/.omp/agent/sandbox.json`. Project policy belongs under
 }
 ```
 
-List fields accumulate for the OS sandbox. In-process gates retain layer identity and evaluate the first matching rule in this order, strongest first:
+List fields accumulate for the OS sandbox. In-process filesystem gates retain scope identity and select the first scope containing any matching rule, strongest first:
 
-1. Session allow
-2. Project tool allow
-3. Project tool deny
-4. Project generic allow
-5. Project generic deny
-6. Global tool allow
-7. Global tool deny
-8. Global generic deny
-9. Global generic allow
-10. No match: paths under the project directory are allowed; other paths, domains, and SSH hosts prompt
+1. Session grants
+2. Project tool policy
+3. Project generic policy
+4. Global tool policy
+5. Global generic policy
+6. Built-in defaults
 
-An allow in a stronger layer can therefore punch through a weaker deny. Subprocess policy is intentionally broader: sandbox-runtime receives the union of applicable lists and applies its own OS-level deny/allow semantics.
+Within that scope, the matching path with the deepest and longest literal prefix wins. Exact paths outrank globs and parent-directory matches at equal specificity; deny wins an exact tie. A stronger scope still overrides every weaker scope. With no filesystem match, paths under the project directory and `/tmp` are allowed while other paths prompt. Domain and SSH gates retain their ordered allow/deny precedence.
+
+Subprocess policy is intentionally broader: sandbox-runtime receives the union of applicable lists and applies its own OS-level deny/allow semantics.
 
 The default policy makes the project directory readable and writable without listing `"."`; stronger explicit denies still win. Subprocess reads are deny-by-default outside configured paths, and exact `"*"` in `allowRead` opts into read-all. In-process tools may use host `/tmp` by default. Subprocesses instead receive a private tmpfs-backed `/tmp` unless `/tmp` is explicitly present in `allowRead` or `allowWrite`.
 

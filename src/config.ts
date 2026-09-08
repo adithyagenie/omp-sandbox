@@ -47,6 +47,10 @@ export interface ResolvedLists {
   sshAllow: string[];
   sshDeny: string[];
 }
+export interface PathRuleScope {
+  allow: string[];
+  deny: string[];
+}
 
 export interface MigrationState {
   migrationDone: boolean;
@@ -370,10 +374,22 @@ export function ruleLayersForTool(
   raw: { globalSection: SandboxConfig; projectSection: SandboxConfig },
   tool: string | null,
   session: SessionAllowances,
-): { read: RuleLayer[]; write: RuleLayer[]; domains: RuleLayer[]; ssh: RuleLayer[] } {
+): { read: PathRuleScope[]; write: PathRuleScope[]; domains: RuleLayer[]; ssh: RuleLayer[] } {
   const globalTool = tool ? raw.globalSection.tools?.[tool] : undefined;
   const projectTool = tool ? raw.projectSection.tools?.[tool] : undefined;
-  const build = (
+  const buildPaths = (
+    sessionList: string[],
+    allow: (section: SandboxConfig | ToolPolicyOverride | undefined) => string[] | undefined,
+    deny: (section: SandboxConfig | ToolPolicyOverride | undefined) => string[] | undefined,
+  ): PathRuleScope[] => [
+    { allow: sessionList, deny: [] },
+    { allow: allow(projectTool) ?? [], deny: deny(projectTool) ?? [] },
+    { allow: allow(raw.projectSection) ?? [], deny: deny(raw.projectSection) ?? [] },
+    { allow: allow(globalTool) ?? [], deny: deny(globalTool) ?? [] },
+    { allow: allow(raw.globalSection) ?? [], deny: deny(raw.globalSection) ?? [] },
+    { allow: allow(DEFAULT_CONFIG) ?? [], deny: deny(DEFAULT_CONFIG) ?? [] },
+  ];
+  const buildHosts = (
     sessionList: string[],
     allow: (section: SandboxConfig | ToolPolicyOverride | undefined) => string[] | undefined,
     deny: (section: SandboxConfig | ToolPolicyOverride | undefined) => string[] | undefined,
@@ -389,9 +405,9 @@ export function ruleLayersForTool(
     { list: unionPaths(allow(DEFAULT_CONFIG), allow(raw.globalSection)), effect: "allow" },
   ];
   return {
-    read: build(session.read, (s) => s?.filesystem?.allowRead, (s) => s?.filesystem?.denyRead),
-    write: build(session.write, (s) => s?.filesystem?.allowWrite, (s) => s?.filesystem?.denyWrite),
-    domains: build(session.domains, (s) => s?.network?.allowedDomains, (s) => s?.network?.deniedDomains),
-    ssh: build(session.ssh, (s) => s?.ssh?.allow, (s) => s?.ssh?.deny),
+    read: buildPaths(session.read, (s) => s?.filesystem?.allowRead, (s) => s?.filesystem?.denyRead),
+    write: buildPaths(session.write, (s) => s?.filesystem?.allowWrite, (s) => s?.filesystem?.denyWrite),
+    domains: buildHosts(session.domains, (s) => s?.network?.allowedDomains, (s) => s?.network?.deniedDomains),
+    ssh: buildHosts(session.ssh, (s) => s?.ssh?.allow, (s) => s?.ssh?.deny),
   };
 }
