@@ -1,6 +1,6 @@
 {
   "name": "pi-sandbox-omp",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "description": "OS-level sandboxing for omp (oh-my-pi) with interactive permission prompts. Functional rewrite of carderne/pi-sandbox for the @oh-my-pi runtime.",
   "type": "module",
   "license": "MIT",
