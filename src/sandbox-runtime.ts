@@ -2,6 +2,7 @@ import type { AgentToolResult } from "@oh-my-pi/pi-coding-agent";
 import { SandboxManager, type SandboxAskCallback, type SandboxRuntimeConfig } from "@carderne/sandbox-runtime";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
+import { basename } from "node:path";
 import type { SandboxConfig, SessionAllowances } from "./config.ts";
 import { unionListsForTool } from "./config.ts";
 import { buildRuntimeNetwork, domainIsAllowed, shellQuoteArg } from "./policy.ts";
@@ -81,6 +82,10 @@ export function bashShellPath(): string {
     cachedBashPath = ["/bin/bash", "/usr/bin/bash", "/bin/sh"].find((path) => existsSync(path)) ?? "/bin/sh";
   }
   return cachedBashPath;
+}
+
+export function sandboxShellName(): string {
+  return basename(bashShellPath());
 }
 
 export function ensureSandboxTmpdir(): void {
@@ -177,7 +182,7 @@ export async function runSandboxedShell(
 ): Promise<ShellRunResult> {
   if (!existsSync(cwd)) throw new Error(`Working directory does not exist: ${cwd}`);
   const wrapped = opts.wrap ?? true
-    ? await SandboxManager.wrapWithSandbox(command, shellPath, opts.customConfig)
+    ? await SandboxManager.wrapWithSandbox(command, basename(shellPath), opts.customConfig)
     : command;
   const { promise, resolve: resolvePromise, reject } = Promise.withResolvers<ShellRunResult>();
   const child = spawn(shellPath, ["-c", wrapped], {
@@ -276,7 +281,7 @@ export async function ensureLaunchTemplate(
   const generation = shared.launchGeneration;
   const promise = SandboxManager.wrapWithSandbox(
     `exec ${shellQuoteArg(bashShellPath())} -c "$${LAUNCH_CMD_VAR}"`,
-    bashShellPath(),
+    sandboxShellName(),
     filesystemOverride(shared, raw, scope),
   ).then((wrapped) => {
     shared.launchTemplates.set(cacheKey, { generation, wrapped });

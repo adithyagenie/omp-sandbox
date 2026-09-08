@@ -39,6 +39,7 @@ import {
   outputStats,
   resetSandbox,
   runSandboxedShell,
+  sandboxShellName,
   toToolResult,
   updateSandboxConfig,
   withExtensionHandlerTimeoutBridge,
@@ -345,7 +346,7 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
       try {
         wrapped = await SandboxManager.wrapWithSandbox(
           shellQuoteJoin(argv),
-          bashShellPath(),
+          sandboxShellName(),
           filesystemConfig(loaded, "hub", shared.session),
         );
       } catch (error) {
