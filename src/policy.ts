@@ -1,8 +1,7 @@
 import type { SandboxRuntimeConfig } from "@carderne/sandbox-runtime";
 import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, resolve } from "node:path";
-import type { SandboxConfig } from "./config.ts";
+import { basename, dirname, isAbsolute, resolve } from "node:path";
 
 export function extractDomainsFromCommand(command: string): string[] {
   const urlRegex = /https?:\/\/([a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g;
@@ -285,10 +284,13 @@ export type PolicyDecision = "allow" | "deny" | "prompt";
 export type PolicyRuleLayer = { list: string[]; effect: "allow" | "deny" };
 
 export function decidePath(layers: PolicyRuleLayer[], absolutePath: string, cwd: string): PolicyDecision {
-  for (const layer of layers) {
-    if (matchesPattern(absolutePath, layer.list)) return layer.effect;
-  }
   const canonicalCwd = canonicalizePath(cwd);
+  for (const layer of layers) {
+    const patterns = layer.list.map((pattern) =>
+      pattern.startsWith("~") || isAbsolute(pattern) ? pattern : resolve(canonicalCwd, pattern),
+    );
+    if (matchesPattern(absolutePath, patterns)) return layer.effect;
+  }
   return absolutePath === canonicalCwd || absolutePath.startsWith(canonicalCwd + "/") ? "allow" : "prompt";
 }
 
