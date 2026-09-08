@@ -152,7 +152,12 @@ export function buildRuntimeNetwork(
   sessionDomains: string[],
 ): SandboxRuntimeConfig["network"] {
   if (isUnrestrictedNetwork(network)) {
-    return { ...network, allowedDomains: undefined, deniedDomains: [] } as unknown as SandboxRuntimeConfig["network"];
+    return {
+      ...network,
+      allowedDomains: undefined,
+      deniedDomains: [],
+      allowAllUnixSockets: true,
+    } as unknown as SandboxRuntimeConfig["network"];
   }
   return {
     ...network,

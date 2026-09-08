@@ -102,7 +102,7 @@ An allow in a stronger layer can therefore punch through a weaker deny. Subproce
 
 The default policy makes the project directory readable and writable without listing `"."`; stronger explicit denies still win. Subprocess reads are deny-by-default outside configured paths, and exact `"*"` in `allowRead` opts into read-all. In-process tools may use host `/tmp` by default. Subprocesses instead receive a private tmpfs-backed `/tmp` unless `/tmp` is explicitly present in `allowRead` or `allowWrite`.
 
-`network.allowedDomains: ["*"]` with an empty deny list disables network isolation and shares the host network. This does not approve SSH; use `ssh.allow: ["*"]` explicitly if that behavior is intended.
+`network.allowedDomains: ["*"]` with an empty deny list disables network isolation, shares the host network, and allows all Unix sockets. This does not approve SSH; use `ssh.allow: ["*"]` explicitly if that behavior is intended.
 
 Default policy denies reads and writes under `~/.omp/agent`. These are ordinary defaults and can be overridden by a stronger project, tool, or session allow.
 
