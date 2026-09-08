@@ -27,7 +27,7 @@ import {
   extractBlockedWritePath,
   extractDomainsFromCommand,
   extractSshTargets,
-  isUnrestrictedNetwork,
+  allowsAllNetworkDomains,
   shellQuoteJoin,
 } from "./policy.ts";
 import {
@@ -202,7 +202,7 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
     tool: string,
   ): Promise<{ block: true; reason: string } | undefined> {
     const loaded = load(ctx.cwd);
-    if (isUnrestrictedNetwork(loaded.config.network)) return undefined;
+    if (allowsAllNetworkDomains(loaded.config.network)) return undefined;
     const decision = decideHost(ruleLayersForTool(loaded, tool, shared.session).domains, domain);
     if (decision === "allow") return undefined;
     if (decision === "deny") return { block: true, reason: `Sandbox: network access to "${domain}" denied by policy.` };
@@ -354,7 +354,7 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
         return errorResult(`Sandbox: failed to wrap hub launch in the OS sandbox: ${error instanceof Error ? error.message : error}`);
       }
       const ui = ctx.hasUI ? ctx.ui : shared.mainUi;
-      if (ui && params.ready?.port !== undefined && !isUnrestrictedNetwork(loaded.config.network)) {
+      if (ui && params.ready?.port !== undefined) {
         ui.notify(`Sandbox network isolation is on: ready.port ${params.ready.port} cannot accept host connections; use ready.log.`, "warning");
       }
       if (ui && (params.detached || params.persist)) {

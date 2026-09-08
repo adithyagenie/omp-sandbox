@@ -100,7 +100,7 @@ Subprocess policy is intentionally broader: sandbox-runtime receives the union o
 
 The default policy makes the project directory readable and writable without listing `"."`; stronger explicit denies still win. Subprocess reads are deny-by-default outside configured paths, and exact `"*"` in `allowRead` opts into read-all. In-process tools may use host `/tmp` by default. Subprocesses instead receive a private tmpfs-backed `/tmp` unless `/tmp` is explicitly present in `allowRead` or `allowWrite`.
 
-`network.allowedDomains: ["*"]` with an empty deny list disables network isolation, shares the host network, and allows all Unix sockets. This does not approve SSH; use `ssh.allow: ["*"]` explicitly if that behavior is intended.
+`network.allowedDomains: ["*"]` with an empty deny list keeps subprocesses behind sandbox-runtime's filtering proxy while allowing every domain, avoiding direct DNS dependencies inside the isolated network namespace. It also allows all Unix sockets. This does not approve SSH; use `ssh.allow: ["*"]` explicitly if that behavior is intended.
 
 Default policy denies reads and writes under `~/.omp/agent`. These are ordinary defaults and can be overridden by a stronger project, tool, or session allow.
 
@@ -136,6 +136,6 @@ Persistent grants update generic allow lists. Per-tool overrides are hand-edited
 | `xd://github`, `xd://browser` | Host subprocess launch under OS sandbox by default |
 | Task subagents | Shared runtime and session grants; prompts routed to main TUI |
 
-The launch guard never wraps omp worker/broker processes, `process.execPath`, sandbox infrastructure helpers, or IPC spawns. Sandboxed daemons remain tied to the broker lifetime despite `persist` or `detached`, because bubblewrap uses parent-death containment. A restricted daemon listening on `ready.port` is inside the sandbox network namespace; use log readiness unless the host network is intentionally shared.
+The launch guard never wraps omp worker/broker processes, `process.execPath`, sandbox infrastructure helpers, or IPC spawns. Sandboxed daemons remain tied to the broker lifetime despite `persist` or `detached`, because bubblewrap uses parent-death containment. A restricted daemon listening on `ready.port` is inside the sandbox network namespace and cannot accept host connections; use log readiness.
 
 Linux behavior is functionally verified. The macOS `sandbox-exec` path follows sandbox-runtime's supported API but is not exercised by this repository's Linux verification workflow.

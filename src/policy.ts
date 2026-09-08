@@ -144,7 +144,7 @@ export function domainIsAllowed(domain: string, allowedDomains: string[]): boole
   return allowedDomains.some((pattern) => domainMatchesPattern(domain, pattern));
 }
 
-export function isUnrestrictedNetwork(network: SandboxConfig["network"]): boolean {
+export function allowsAllNetworkDomains(network: SandboxConfig["network"]): boolean {
   return allowsAllDomains(network?.allowedDomains) && (network?.deniedDomains?.length ?? 0) === 0;
 }
 
@@ -152,24 +152,19 @@ export function buildRuntimeNetwork(
   network: SandboxConfig["network"],
   sessionDomains: string[],
 ): SandboxRuntimeConfig["network"] {
-  if (isUnrestrictedNetwork(network)) {
-    return {
-      ...network,
-      allowedDomains: undefined,
-      deniedDomains: [],
-      allowAllUnixSockets: true,
-    } as unknown as SandboxRuntimeConfig["network"];
-  }
   return {
     ...network,
     allowedDomains: [...(network?.allowedDomains ?? []), ...sessionDomains],
     deniedDomains: network?.deniedDomains ?? [],
+    allowAllUnixSockets: allowsAllNetworkDomains(network) || undefined,
   };
 }
 
 export function formatNetworkLabel(network: SandboxConfig["network"]): string {
-  if (isUnrestrictedNetwork(network)) return "unrestricted (host network)";
-  if (allowsAllDomains(network?.allowedDomains)) return "all domains";
+  if (allowsAllNetworkDomains(network)) return "all domains (proxied)";
+  if (allowsAllDomains(network?.allowedDomains)) {
+    return `all domains except ${network?.deniedDomains?.length ?? 0} denied`;
+  }
   return `${network?.allowedDomains?.length ?? 0} domains`;
 }
 

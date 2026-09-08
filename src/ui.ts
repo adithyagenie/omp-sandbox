@@ -2,7 +2,7 @@ import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@oh-my-pi/pi-tui";
 import type { SandboxConfig, SessionAllowances } from "./config.ts";
 import { getGlobalConfigPath } from "./config.ts";
-import { canonicalizePath, allowsAllDomains, formatNetworkLabel, isUnrestrictedNetwork } from "./policy.ts";
+import { canonicalizePath, allowsAllDomains, formatNetworkLabel } from "./policy.ts";
 
 export type PermissionChoice = "abort" | "session" | "project" | "global";
 
@@ -149,9 +149,11 @@ export function promptSshBlock(ctx: ExtensionContext, host: string): Promise<Per
 
 export function warnIfAllDomainsAllowed(ctx: ExtensionContext, config: SandboxConfig): void {
   if (!allowsAllDomains(config.network?.allowedDomains)) return;
-  const message = isUnrestrictedNetwork(config.network)
-    ? '⚠️ Network isolation is DISABLED: allowedDomains is "*" with no deniedDomains, so sandboxed commands share the host network. Add a deniedDomains entry or remove "*" to re-enable the filtering proxy.'
-    : '⚠️ Network sandbox allows all domains because network.allowedDomains contains "*". Remove "*" to restore per-domain prompts.';
+  const deniedCount = config.network?.deniedDomains?.length ?? 0;
+  const message =
+    deniedCount === 0
+      ? '⚠️ Network sandbox allows all domains through its filtering proxy because allowedDomains contains "*". Unix socket access is also enabled.'
+      : `⚠️ Network sandbox allows every domain not matched by ${deniedCount} deniedDomains rule${deniedCount === 1 ? "" : "s"}.`;
   ctx.ui.notify(message, "warning");
 }
 
@@ -194,6 +196,6 @@ export function formatSandboxConfiguration(config: SandboxConfig, extras: Config
   lines.push("tools:");
   if (toolEntries.length === 0) lines.push("  (none)");
   for (const [tool, override] of toolEntries) lines.push(`  ${tool}: ${JSON.stringify(override)}`);
-  if (isUnrestrictedNetwork(config.network)) lines.push("warning: sandboxed subprocesses share the host network");
+  if (allowsAllDomains(config.network?.allowedDomains)) lines.push("warning: sandboxed subprocesses can reach all non-denied domains through the filtering proxy");
   return lines.join("\n");
 }
