@@ -199,9 +199,10 @@ export function canonicalizePath(filePath: string): string {
   }
 }
 
-export function matchesPattern(filePath: string, patterns: string[]): boolean {
+export function matchesPattern(filePath: string, patterns: string[], exactWildcardMatchesAll = false): boolean {
   const absolute = canonicalizePath(filePath);
   return patterns.some((pattern) => {
+    if (pattern === "*" && exactWildcardMatchesAll) return true;
     const candidate = pattern.includes("*") ? expandPath(pattern) : canonicalizePath(pattern);
     if (pattern.includes("*")) {
       const escaped = candidate.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
@@ -283,15 +284,32 @@ export function collectWriteTargets(toolName: string, input: Record<string, unkn
 export type PolicyDecision = "allow" | "deny" | "prompt";
 export type PolicyRuleLayer = { list: string[]; effect: "allow" | "deny" };
 
-export function decidePath(layers: PolicyRuleLayer[], absolutePath: string, cwd: string): PolicyDecision {
+export function decidePath(
+  layers: PolicyRuleLayer[],
+  absolutePath: string,
+  cwd: string,
+  exactWildcardMatchesAll = false,
+): PolicyDecision {
   const canonicalCwd = canonicalizePath(cwd);
+  const canonicalPath = canonicalizePath(absolutePath);
   for (const layer of layers) {
+    const wildcardMatchesAll = exactWildcardMatchesAll && layer.effect === "allow";
     const patterns = layer.list.map((pattern) =>
-      pattern.startsWith("~") || isAbsolute(pattern) ? pattern : resolve(canonicalCwd, pattern),
+      pattern === "*" && wildcardMatchesAll
+        ? pattern
+        : pattern.startsWith("~") || isAbsolute(pattern)
+          ? pattern
+          : resolve(canonicalCwd, pattern),
     );
-    if (matchesPattern(absolutePath, patterns)) return layer.effect;
+    if (matchesPattern(canonicalPath, patterns, wildcardMatchesAll)) return layer.effect;
   }
-  return absolutePath === canonicalCwd || absolutePath.startsWith(canonicalCwd + "/") ? "allow" : "prompt";
+  const canonicalTmp = canonicalizePath("/tmp");
+  const implicitlyAllowed =
+    canonicalPath === canonicalCwd ||
+    canonicalPath.startsWith(canonicalCwd + "/") ||
+    canonicalPath === canonicalTmp ||
+    canonicalPath.startsWith(canonicalTmp + "/");
+  return implicitlyAllowed ? "allow" : "prompt";
 }
 
 export function decideHost(layers: PolicyRuleLayer[], host: string): PolicyDecision {

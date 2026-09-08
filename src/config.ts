@@ -53,7 +53,12 @@ export interface MigrationState {
 }
 
 export const DEFAULT_SANDBOXED_DEVICES = ["github", "browser"];
-const agentDir = getAgentDir();
+export function getSandboxAgentDir(): string {
+  const root = getAgentDir();
+  return basename(root) === "agent" ? root : join(root, "agent");
+}
+
+const agentDir = getSandboxAgentDir();
 
 export const DEFAULT_CONFIG: SandboxConfig = {
   enabled: true,
@@ -75,7 +80,7 @@ export const DEFAULT_CONFIG: SandboxConfig = {
   filesystem: {
     denyRead: ["/Users", "/home", agentDir],
     allowRead: [".", "~/.config", "~/.local", "Library"],
-    allowWrite: [".", "/tmp"],
+    allowWrite: ["."],
     denyWrite: [".env", ".env.*", "*.pem", "*.key", agentDir],
   },
   sandboxedDevices: [...DEFAULT_SANDBOXED_DEVICES],
@@ -104,12 +109,35 @@ function canonicalProjectDir(filePath: string): string {
 }
 
 export function getGlobalConfigPath(): string {
-  return join(getAgentDir(), "sandbox.json");
+  return join(agentDir, "sandbox.json");
 }
 
 /** Union two path/domain lists, preserving order and dropping duplicates. */
 export function unionPaths(a?: string[], b?: string[]): string[] {
   return [...new Set([...(a ?? []), ...(b ?? [])])];
+}
+
+type RuntimeFilesystemConfig = NonNullable<SandboxRuntimeConfig["filesystem"]>;
+
+/**
+ * The runtime's read rules are deny-list based. Add a root deny unless the
+ * user explicitly selected read-all with "*"; allowRead paths are then carved
+ * back into the denied root by the platform sandbox.
+ */
+export function defaultDenyReadFilesystem(filesystem: RuntimeFilesystemConfig): RuntimeFilesystemConfig {
+  const allowRead = filesystem.allowRead ?? [];
+  const allowAll = allowRead.includes("*");
+  const explicitDenyRead = filesystem.denyRead ?? [];
+  // Windows runs as a dedicated low-privilege user and grants configured paths
+  // with ACLs; adding POSIX root denies would neither parse nor enforce there.
+  const denyRead = allowAll || process.platform === "win32"
+    ? [...explicitDenyRead]
+    : unionPaths(["/"], explicitDenyRead);
+  return {
+    ...filesystem,
+    allowRead: allowRead.filter((path) => path !== "*"),
+    denyRead,
+  };
 }
 
 function mergeToolOverride(

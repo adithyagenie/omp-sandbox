@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import { basename } from "node:path";
 import type { SandboxConfig, SessionAllowances } from "./config.ts";
-import { unionListsForTool } from "./config.ts";
+import { defaultDenyReadFilesystem, unionListsForTool } from "./config.ts";
 import { buildRuntimeNetwork, domainIsAllowed, shellQuoteArg } from "./policy.ts";
 
 export interface ShellRunResult {
@@ -116,13 +116,13 @@ function managerConfig(config: SandboxConfig, session: SessionAllowances): Sandb
   return {
     ...runtime,
     network: buildRuntimeNetwork(config.network, session.domains),
-    filesystem: {
+    filesystem: defaultDenyReadFilesystem({
       ...config.filesystem,
       denyRead: config.filesystem?.denyRead ?? [],
       allowRead: [...(config.filesystem?.allowRead ?? []), ...session.read],
       allowWrite: [...(config.filesystem?.allowWrite ?? []), ...session.write],
       denyWrite: config.filesystem?.denyWrite ?? [],
-    },
+    }),
     enableWeakerNetworkIsolation: true,
   } as SandboxRuntimeConfig;
 }
@@ -259,12 +259,12 @@ function filesystemOverride(
 ): SandboxRuntimeConfig {
   const lists = unionListsForTool(raw, scope === "eval" ? "eval" : null, shared.session);
   return {
-    filesystem: {
+    filesystem: defaultDenyReadFilesystem({
       allowRead: lists.allowRead,
       denyRead: lists.denyRead,
       allowWrite: lists.allowWrite,
       denyWrite: lists.denyWrite,
-    },
+    }),
   } as SandboxRuntimeConfig;
 }
 

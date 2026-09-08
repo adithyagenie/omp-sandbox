@@ -45,7 +45,7 @@ omp plugin link .
 
 ## Configuration
 
-Configuration lives at `~/.omp/agent/sandbox.json` (`getAgentDir()/sandbox.json`). Project policy belongs under `projects["<canonical-project-directory>"]`; no project-local config is created.
+Configuration lives at `~/.omp/agent/sandbox.json`. Project policy belongs under `projects["<canonical-project-directory>"]`; no project-local config is created.
 
 ```json
 {
@@ -56,8 +56,8 @@ Configuration lives at `~/.omp/agent/sandbox.json` (`getAgentDir()/sandbox.json`
   },
   "filesystem": {
     "denyRead": ["~/.omp/agent"],
-    "allowRead": [".", "~/.config"],
-    "allowWrite": [".", "/tmp"],
+    "allowRead": ["~/.config"],
+    "allowWrite": ["~/.cache/uv"],
     "denyWrite": [".env", "*.pem", "~/.omp/agent"]
   },
   "ssh": {
@@ -99,6 +99,8 @@ List fields accumulate for the OS sandbox. In-process gates retain layer identit
 10. No match: paths under the project directory are allowed; other paths, domains, and SSH hosts prompt
 
 An allow in a stronger layer can therefore punch through a weaker deny. Subprocess policy is intentionally broader: sandbox-runtime receives the union of applicable lists and applies its own OS-level deny/allow semantics.
+
+The default policy makes the project directory readable and writable without listing `"."`; stronger explicit denies still win. Subprocess reads are deny-by-default outside configured paths, and exact `"*"` in `allowRead` opts into read-all. In-process tools may use host `/tmp` by default. Subprocesses instead receive a private tmpfs-backed `/tmp` unless `/tmp` is explicitly present in `allowRead` or `allowWrite`.
 
 `network.allowedDomains: ["*"]` with an empty deny list disables network isolation and shares the host network. This does not approve SSH; use `ssh.allow: ["*"]` explicitly if that behavior is intended.
 

@@ -7,6 +7,7 @@ import {
   addSshHostToConfig,
   addWritePathToConfig,
   DEFAULT_SANDBOXED_DEVICES,
+  defaultDenyReadFilesystem,
   loadConfig,
   readOrEmptyConfig,
   ruleLayersForTool,
@@ -111,12 +112,12 @@ function filesystemConfig(
 ): SandboxRuntimeConfig {
   const lists = unionListsForTool(raw, tool, session);
   return {
-    filesystem: {
+    filesystem: defaultDenyReadFilesystem({
       allowRead: lists.allowRead,
       denyRead: lists.denyRead,
       allowWrite: lists.allowWrite,
       denyWrite: lists.denyWrite,
-    },
+    }),
   } as SandboxRuntimeConfig;
 }
 
@@ -411,7 +412,7 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
         continue;
       }
       const path = canonicalizePath(target.path);
-      const decision = decidePath(ruleLayersForTool(loaded, tool, shared.session).read, path, ctx.cwd);
+      const decision = decidePath(ruleLayersForTool(loaded, tool, shared.session).read, path, ctx.cwd, true);
       if (decision === "deny") return { block: true, reason: `Sandbox: read access denied for "${path}" (denied by policy).` };
       if (decision === "prompt") {
         const choice = await askChoice(ctx, (routed) => promptReadBlock(routed, path));

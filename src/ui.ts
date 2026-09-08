@@ -1,7 +1,7 @@
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { getAgentDir } from "@oh-my-pi/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@oh-my-pi/pi-tui";
 import type { SandboxConfig, SessionAllowances } from "./config.ts";
+import { getGlobalConfigPath } from "./config.ts";
 import { canonicalizePath, allowsAllDomains, formatNetworkLabel, isUnrestrictedNetwork } from "./policy.ts";
 
 export type PermissionChoice = "abort" | "session" | "project" | "global";
@@ -61,7 +61,7 @@ export async function showPermissionPrompt(
 ): Promise<PermissionChoice> {
   if (!ctx.hasUI) return "abort";
   const routedTitle = (ctx as RoutedContext)[SUBAGENT_CONTEXT] ? `[subagent] ${title}` : title;
-  const globalPath = `${getAgentDir()}/sandbox.json`;
+  const globalPath = getGlobalConfigPath();
   const projectKey = canonicalizePath(ctx.cwd);
   const displayedOptions = options.map((option) => {
     if (option.action === "project") return { ...option, hint: `→ projects[${JSON.stringify(projectKey)}] in ${globalPath}` };
@@ -172,7 +172,7 @@ function list(values: string[] | undefined): string {
 export function formatSandboxConfiguration(config: SandboxConfig, extras: ConfigurationExtras): string {
   const lines = [
     `Sandbox: ${config.enabled === false ? "disabled" : "enabled"}`,
-    `config: ${getAgentDir()}/sandbox.json`,
+    `config: ${getGlobalConfigPath()}`,
     `projects: ${list(extras.projectKeys)}`,
     `network allow: ${list(config.network?.allowedDomains)}`,
     `network deny: ${list(config.network?.deniedDomains)}`,
