@@ -68,6 +68,9 @@ export function setLaunchTemplate(state: LaunchGuardState, scope: LaunchScope, t
 }
 
 export function openLaunchWindow(state: LaunchGuardState, toolCallId: string, scope: LaunchScope): void {
+  if (launchWindowActive(state)) {
+    throw new Error("[pi-sandbox-omp] another sandboxed launch is still active; retry the tool call");
+  }
   const template = state.templates.get(scope);
   if (!template) {
     throw new Error("[pi-sandbox-omp] sandboxed launch requested but the bwrap template is not ready; retry the tool call");

@@ -19,6 +19,7 @@ export interface RuntimeSharedState {
   launchTemplates: Map<string, { generation: number; wrapped: string }>;
   launchTemplatePromises: Map<string, Promise<string>>;
   runtimeRawConfig: { globalSection: SandboxConfig; projectSection: SandboxConfig };
+  runtimeRawConfigSignature: string;
 }
 
 export const RUNNER_EXTENSION_HANDLER_TIMEOUT_MS = 30_000;
@@ -100,8 +101,15 @@ export function createNetworkAskCallback(allowedDomains: string[]): SandboxAskCa
 }
 
 function managerConfig(config: SandboxConfig, session: SessionAllowances): SandboxRuntimeConfig {
+  const {
+    enabled: _enabled,
+    sandboxedDevices: _sandboxedDevices,
+    ssh: _ssh,
+    tools: _tools,
+    ...runtime
+  } = config;
   return {
-    ...config,
+    ...runtime,
     network: buildRuntimeNetwork(config.network, session.domains),
     filesystem: {
       ...config.filesystem,
@@ -239,8 +247,12 @@ export function outputStats(output: string): {
   return { totalLines: lines, totalBytes: bytes, outputLines: lines, outputBytes: bytes };
 }
 
-function filesystemOverride(shared: RuntimeSharedState, scope: "device" | "eval"): SandboxRuntimeConfig {
-  const lists = unionListsForTool(shared.runtimeRawConfig, scope === "eval" ? "eval" : null, shared.session);
+function filesystemOverride(
+  shared: RuntimeSharedState,
+  raw: { globalSection: SandboxConfig; projectSection: SandboxConfig },
+  scope: "device" | "eval",
+): SandboxRuntimeConfig {
+  const lists = unionListsForTool(raw, scope === "eval" ? "eval" : null, shared.session);
   return {
     filesystem: {
       allowRead: lists.allowRead,
@@ -254,24 +266,26 @@ function filesystemOverride(shared: RuntimeSharedState, scope: "device" | "eval"
 export async function ensureLaunchTemplate(
   shared: RuntimeSharedState,
   scope: "device" | "eval",
+  raw = shared.runtimeRawConfig,
 ): Promise<string> {
-  const cached = shared.launchTemplates.get(scope);
+  const cacheKey = `${scope}:${JSON.stringify(raw)}`;
+  const cached = shared.launchTemplates.get(cacheKey);
   if (cached?.generation === shared.launchGeneration) return cached.wrapped;
-  const existing = shared.launchTemplatePromises.get(scope);
+  const existing = shared.launchTemplatePromises.get(cacheKey);
   if (existing) return existing;
   const generation = shared.launchGeneration;
   const promise = SandboxManager.wrapWithSandbox(
     `exec ${shellQuoteArg(bashShellPath())} -c "$${LAUNCH_CMD_VAR}"`,
     bashShellPath(),
-    filesystemOverride(shared, scope),
+    filesystemOverride(shared, raw, scope),
   ).then((wrapped) => {
-    shared.launchTemplates.set(scope, { generation, wrapped });
-    shared.launchTemplatePromises.delete(scope);
+    shared.launchTemplates.set(cacheKey, { generation, wrapped });
+    shared.launchTemplatePromises.delete(cacheKey);
     return wrapped;
   }).catch((error: unknown) => {
-    shared.launchTemplatePromises.delete(scope);
+    shared.launchTemplatePromises.delete(cacheKey);
     throw error;
   });
-  shared.launchTemplatePromises.set(scope, promise);
+  shared.launchTemplatePromises.set(cacheKey, promise);
   return promise;
 }

@@ -230,10 +230,16 @@ export function takeMigrationNotices(): string[] {
   return migrationNotices.splice(0);
 }
 
+export interface LoadedConfig {
+  config: SandboxConfig;
+  globalSection: SandboxConfig;
+  projectSection: SandboxConfig;
+}
+
 export function loadConfig(
   cwd: string,
   migrationState: MigrationState = moduleMigrationState,
-): { config: SandboxConfig; globalSection: SandboxConfig; projectSection: SandboxConfig } {
+): LoadedConfig {
   migrateLegacyConfig(cwd, migrationState);
   const path = getGlobalConfigPath();
   let file: GlobalConfigFile = {};
