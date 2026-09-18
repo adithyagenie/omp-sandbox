@@ -122,6 +122,25 @@ export function unionPaths(a?: string[], b?: string[]): string[] {
 }
 
 type RuntimeFilesystemConfig = NonNullable<SandboxRuntimeConfig["filesystem"]>;
+const LINUX_ROOT_READ_COMPATIBILITY_PATHS = [
+  "/etc/ssl/certs",
+  "/etc/ssl/cert.pem",
+  "/etc/pki/tls/certs",
+  "/etc/pki/ca-trust/extracted",
+  "/etc/ca-certificates",
+  "/bin",
+  "/usr/bin",
+];
+
+function explicitDenyCoversPath(filePath: string, pattern: string): boolean {
+  if (pattern === "*" || pattern === "/") return true;
+  const absolutePattern = resolve(pattern);
+  if (!absolutePattern.includes("*")) {
+    return filePath === absolutePattern || filePath.startsWith(absolutePattern + "/");
+  }
+  const escaped = absolutePattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+  return new RegExp(`^${escaped}$`).test(filePath);
+}
 
 /**
  * The runtime's read rules are deny-list based. Add a root deny unless the
@@ -129,17 +148,26 @@ type RuntimeFilesystemConfig = NonNullable<SandboxRuntimeConfig["filesystem"]>;
  * back into the denied root by the platform sandbox.
  */
 export function defaultDenyReadFilesystem(filesystem: RuntimeFilesystemConfig): RuntimeFilesystemConfig {
-  const allowRead = filesystem.allowRead ?? [];
-  const allowAll = allowRead.includes("*");
+  const configuredAllowRead = filesystem.allowRead ?? [];
+  const allowAll = configuredAllowRead.includes("*");
   const explicitDenyRead = filesystem.denyRead ?? [];
   // Windows runs as a dedicated low-privilege user and grants configured paths
   // with ACLs; adding POSIX root denies would neither parse nor enforce there.
-  const denyRead = allowAll || process.platform === "win32"
-    ? [...explicitDenyRead]
-    : unionPaths(["/"], explicitDenyRead);
+  const addRootDeny = !allowAll && process.platform !== "win32";
+  const denyRead = addRootDeny
+    ? unionPaths(["/"], explicitDenyRead)
+    : [...explicitDenyRead];
+  const compatibilityPaths = process.platform === "linux"
+    ? LINUX_ROOT_READ_COMPATIBILITY_PATHS.filter((filePath) =>
+      existsSync(filePath) && !explicitDenyRead.some((pattern) => explicitDenyCoversPath(filePath, pattern))
+    )
+    : [];
+  const allowRead = addRootDeny
+    ? unionPaths(configuredAllowRead, compatibilityPaths)
+    : configuredAllowRead.filter((path) => path !== "*");
   return {
     ...filesystem,
-    allowRead: allowRead.filter((path) => path !== "*"),
+    allowRead,
     denyRead,
   };
 }
