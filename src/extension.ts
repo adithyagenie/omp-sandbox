@@ -73,6 +73,7 @@ import {
 interface ActiveSshContext {
   ctx: ExtensionContext;
   tool: string;
+  deferredHosts: Set<string>;
   openedAt: number;
 }
 
@@ -251,7 +252,20 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
       return false;
     }
     const active = shared.sshContexts.values().next().value as ActiveSshContext;
-    return await enforceSshHostGate(host, active.ctx, active.tool) === undefined;
+    const loaded = load(active.ctx.cwd);
+    const decision = decideHost(ruleLayersForTool(loaded, active.tool, shared.session).ssh, host);
+    if (decision === "allow") return true;
+    if (decision === "prompt") active.deferredHosts.add(host);
+    return false;
+  }
+
+  async function promptDeferredSshHosts(active: ActiveSshContext): Promise<void> {
+    for (const host of active.deferredHosts) {
+      const block = await enforceSshHostGate(host, active.ctx, active.tool);
+      if (block) continue;
+      const ui = active.ctx.hasUI ? active.ctx.ui : shared.mainUi;
+      ui?.notify(`SSH access to "${host}" granted. Retry the command.`, "info");
+    }
   }
 
   async function withRuntimeSshContext<TResult>(
@@ -260,12 +274,15 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
     tool: string,
     run: () => Promise<TResult>,
   ): Promise<TResult> {
-    const active = { ctx, tool, openedAt: Date.now() };
+    const active: ActiveSshContext = { ctx, tool, openedAt: Date.now(), deferredHosts: new Set() };
     shared.sshContexts.set(id, active);
     try {
       return await run();
     } finally {
-      if (shared.sshContexts.get(id) === active) shared.sshContexts.delete(id);
+      if (shared.sshContexts.get(id) === active) {
+        shared.sshContexts.delete(id);
+        await promptDeferredSshHosts(active);
+      }
     }
   }
 
@@ -520,7 +537,7 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
       try {
         await prepareLaunch("eval", loaded);
         openLaunchWindow(shared.launchGuard, event.toolCallId, "eval");
-        shared.sshContexts.set(event.toolCallId, { ctx, tool, openedAt: Date.now() });
+        shared.sshContexts.set(event.toolCallId, { ctx, tool, openedAt: Date.now(), deferredHosts: new Set() });
       } catch (error) {
         return { block: true, reason: `Sandbox: failed to prepare eval sandbox: ${error instanceof Error ? error.message : error}. Retry the tool call.` };
       }
@@ -533,7 +550,7 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
         try {
           await prepareLaunch("device", loaded);
           openLaunchWindow(shared.launchGuard, event.toolCallId, "device");
-          shared.sshContexts.set(event.toolCallId, { ctx, tool, openedAt: Date.now() });
+          shared.sshContexts.set(event.toolCallId, { ctx, tool, openedAt: Date.now(), deferredHosts: new Set() });
         } catch (error) {
           return { block: true, reason: `Sandbox: failed to prepare the OS sandbox for xd://${device} launches: ${error instanceof Error ? error.message : error}. Retry the tool call.` };
         }
@@ -541,9 +558,11 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
     }
   }));
 
-  const closeWindow = (event: { toolCallId: string }): void => {
+  const closeWindow = async (event: { toolCallId: string }): Promise<void> => {
     closeLaunchWindow(shared.launchGuard, event.toolCallId);
+    const active = shared.sshContexts.get(event.toolCallId);
     shared.sshContexts.delete(event.toolCallId);
+    if (active) await promptDeferredSshHosts(active);
   };
   pi.on("tool_result", withExtensionHandlerTimeoutBridge(timeoutBridge, async (event) => closeWindow(event)));
   pi.on("tool_execution_end" as never, withExtensionHandlerTimeoutBridge(timeoutBridge, async (event: { toolCallId: string }) => closeWindow(event)) as never);
