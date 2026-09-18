@@ -25,6 +25,7 @@ import {
   decideHost,
   decidePath,
   extractBlockedWritePath,
+  extractFileMentionPaths,
   extractDomainsFromCommand,
   extractSshTargets,
   allowsAllNetworkDomains,
@@ -412,6 +413,32 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
       return result;
     },
   });
+
+  pi.on("input", withExtensionHandlerTimeoutBridge(timeoutBridge, async (event, ctx) => {
+    refreshMainUi(ctx);
+    if (!shared.enabled) return;
+    const loaded = load(ctx.cwd);
+    if (!loaded.config.enabled) return;
+    for (const rawTarget of extractFileMentionPaths(event.text)) {
+      const target = classifyToolPath(rawTarget);
+      if (target.kind !== "fs") continue;
+      const path = canonicalizePath(target.path, ctx.cwd);
+      const layers = ruleLayersForTool(loaded, "read", shared.session).read;
+      let decision = decidePath(layers, target.path, ctx.cwd, true);
+      if (decision === "deny") {
+        decision = decidePath(layers.slice(0, -1), target.path, ctx.cwd, true);
+        if (decision === "deny") {
+          if (ctx.hasUI) ctx.ui.notify(`Sandbox: attachment read access denied for "${path}" by policy.`, "warning");
+          return { action: "handled" as const };
+        }
+      }
+      if (decision === "prompt") {
+        const choice = await askChoice(ctx, (routed) => promptReadBlock(routed, path));
+        if (choice === "abort") return { action: "handled" as const };
+        await applyReadChoice(choice, path, ctx.cwd);
+      }
+    }
+  }));
 
   pi.on("user_bash", withExtensionHandlerTimeoutBridge(timeoutBridge, async (event, ctx) => {
     refreshMainUi(ctx);

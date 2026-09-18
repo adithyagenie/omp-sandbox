@@ -16,6 +16,13 @@ export function extractDomainsFromCommand(command: string): string[] {
   }
   return [...domains];
 }
+export function extractFileMentionPaths(input: string): string[] {
+  const paths = new Set<string>();
+  for (const match of input.matchAll(/(?:^|\s)@([^\s]+)/g)) {
+    if (match[1]) paths.add(match[1]);
+  }
+  return [...paths];
+}
 
 const SSH_BINARIES: Record<string, true> = {
   ssh: true, scp: true, sftp: true, rsync: true, git: true,
@@ -169,7 +176,7 @@ export function extractSshTargets(command: string): string[] {
     if (binary === "git") {
       for (let cursor = index + 1; cursor < tokens.length; cursor++) {
         const token = tokens[cursor];
-        if (!token.includes("@")) continue;
+        if (!/@[^:]+:/.test(token)) continue;
         const host = hostFromRemoteToken(token);
         if (host) targets.add(host);
       }
