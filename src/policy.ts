@@ -130,6 +130,22 @@ function hostFromSshDestination(token: string): string | null {
   return /^[A-Za-z0-9][A-Za-z0-9.\-]*$/.test(host) ? host : null;
 }
 
+function resolveShellVariables(token: string, variables: Map<string, string>): string {
+  return token.replace(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g, (reference, braced, bare) =>
+    variables.get(braced ?? bare) ?? reference
+  );
+}
+
+function hostFromSshUrlToken(token: string): string | null {
+  if (!token.toLowerCase().startsWith("ssh://")) return null;
+  try {
+    const url = new URL(token);
+    return url.protocol === "ssh:" && url.hostname ? url.hostname : null;
+  } catch {
+    return null;
+  }
+}
+
 export function isHostLike(host: string): boolean {
   return /^[A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,}$/.test(host) || /^(\d{1,3}\.){3}\d{1,3}$/.test(host);
 }
@@ -151,20 +167,42 @@ export function hostFromRemoteToken(token: string): string | null {
 
 export function extractSshTargets(command: string): string[] {
   const targets = new Set<string>();
+  const variables = new Map<string, string>();
   for (const match of command.matchAll(/ssh:\/\/[^\s"'`<>\\]+/gi)) {
-    try {
-      const url = new URL(match[0]);
-      if (url.protocol === "ssh:" && url.hostname) targets.add(url.hostname);
-    } catch {
-      // Runtime protocol enforcement remains the security boundary.
-    }
+    const host = hostFromSshUrlToken(match[0]);
+    if (host) targets.add(host);
   }
 
   for (const segment of shellCommandSegments(command)) {
     const tokens = shellTokens(segment);
     if (tokens.length === 0) continue;
     let index = 0;
-    while (index < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index])) index++;
+    const assignments: Array<[string, string]> = [];
+    while (index < tokens.length) {
+      const assignment = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(tokens[index]);
+      if (!assignment) break;
+      assignments.push([assignment[1], resolveShellVariables(assignment[2], variables)]);
+      index++;
+    }
+    if (index >= tokens.length) {
+      for (const [name, value] of assignments) {
+        if (/^[A-Za-z0-9_.:@/-]+$/.test(value)) variables.set(name, value);
+        else variables.delete(name);
+      }
+      continue;
+    }
+    if ((tokens[index] === "export" || tokens[index] === "readonly") && tokens.length === index + 2) {
+      const assignment = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(tokens[index + 1]);
+      if (assignment) {
+        const value = resolveShellVariables(assignment[2], variables);
+        if (/^[A-Za-z0-9_.:@/-]+$/.test(value)) variables.set(assignment[1], value);
+      }
+      continue;
+    }
+    if (tokens[index] === "unset" && tokens.length === index + 2) {
+      variables.delete(tokens[index + 1]);
+      continue;
+    }
     while (index < tokens.length && SHELL_WRAPPERS[tokens[index]]) {
       index++;
       while (index < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index])) index++;
@@ -175,7 +213,12 @@ export function extractSshTargets(command: string): string[] {
 
     if (binary === "git") {
       for (let cursor = index + 1; cursor < tokens.length; cursor++) {
-        const token = tokens[cursor];
+        const token = resolveShellVariables(tokens[cursor], variables);
+        const urlHost = hostFromSshUrlToken(token);
+        if (urlHost) {
+          targets.add(urlHost);
+          continue;
+        }
         if (!/@[^:]+:/.test(token)) continue;
         const host = hostFromRemoteToken(token);
         if (host) targets.add(host);
@@ -186,13 +229,14 @@ export function extractSshTargets(command: string): string[] {
     const argumentOptions = SSH_OPT_TAKES_ARG[binary];
     const scanAll = binary === "scp" || binary === "rsync";
     for (let cursor = index + 1; cursor < tokens.length; cursor++) {
-      const token = tokens[cursor];
-      if (token.startsWith("--")) continue;
-      if (/^-[A-Za-z]/.test(token)) {
-        const last = token[token.length - 1];
-        if (argumentOptions?.[last] && !token.includes("=") && cursor + 1 < tokens.length) cursor++;
+      const rawToken = tokens[cursor];
+      if (rawToken.startsWith("--")) continue;
+      if (/^-[A-Za-z]/.test(rawToken)) {
+        const last = rawToken[rawToken.length - 1];
+        if (argumentOptions?.[last] && !rawToken.includes("=") && cursor + 1 < tokens.length) cursor++;
         continue;
       }
+      const token = resolveShellVariables(rawToken, variables);
       const host = binary === "ssh" || binary === "sftp"
         ? hostFromSshDestination(token)
         : hostFromRemoteToken(token);
