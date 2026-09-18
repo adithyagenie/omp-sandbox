@@ -125,6 +125,13 @@ type RuntimeFilesystemConfig = NonNullable<SandboxRuntimeConfig["filesystem"]>;
 const LINUX_ROOT_READ_COMPATIBILITY_PATHS = [
   "/etc/ssl/certs",
   "/etc/ssl/cert.pem",
+  "/etc/static/ssl/certs",
+  "/etc/hosts",
+  "/etc/resolv.conf",
+  "/etc/nsswitch.conf",
+  "/etc/gai.conf",
+  "/etc/protocols",
+  "/etc/services",
   "/etc/pki/tls/certs",
   "/etc/pki/ca-trust/extracted",
   "/etc/ca-certificates",
