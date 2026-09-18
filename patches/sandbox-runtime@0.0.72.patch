@@ -25,3 +25,242 @@ index a724be479a1e47facc5069003d2cdc05624ff765..20211cbd8bcf7ff90c542a658fe787aa
      ];
      return recommendedPaths;
  }
+diff --git a/dist/sandbox/http-proxy.js b/dist/sandbox/http-proxy.js
+--- a/dist/sandbox/http-proxy.js
++++ b/dist/sandbox/http-proxy.js
+@@ -8,6 +8,114 @@
+ import { decideAndRespond, } from './request-filter.js';
+ import { peekForClientHello, terminateAndForward, } from './tls-terminate-proxy.js';
+ import { connectViaParentProxy, dialDirect, openConnectTunnel, proxyAuthHeader, selectParentProxyUrl, shouldBypassParentProxy, stripBrackets, stripHopByHop, } from './parent-proxy.js';
++const EMPTY = Buffer.alloc(0);
++const SSH_IDENTIFICATION_PREFIX = Buffer.from('SSH-');
++const SSH_IDENTIFICATION_MAX_BYTES = 255;
++const PROTOCOL_SNIFF_TIMEOUT_MS = 10000;
++
++/**
++ * Inspect both ends of an opaque tunnel before relaying application bytes.
++ * Direct SSH must exchange a cleartext SSH identification line. Server
++ * pre-banner lines are forwarded while inspection continues; client protocol
++ * bytes that do not start with SSH identify a non-SSH tunnel immediately.
++ */
++export function authorizeSshTunnel({ client, upstream, clientHead = EMPTY, filterSsh, host, port }) {
++    client.pause();
++    upstream.pause();
++    return new Promise(resolve => {
++        let pendingClient = clientHead;
++        let pendingUpstream = EMPTY;
++        let settled = false;
++        let authorizing = false;
++        const timer = setTimeout(() => finish(false), PROTOCOL_SNIFF_TIMEOUT_MS);
++        timer.unref?.();
++        const cleanup = () => {
++            clearTimeout(timer);
++            client.removeListener('readable', onClientReadable);
++            upstream.removeListener('readable', onUpstreamReadable);
++            client.removeListener('close', onClose);
++            upstream.removeListener('close', onClose);
++        };
++        const finish = (allowed) => {
++            if (settled)
++                return;
++            settled = true;
++            cleanup();
++            resolve({ allowed, clientHead: pendingClient, upstreamHead: pendingUpstream });
++        };
++        const authorize = async () => {
++            if (authorizing || settled)
++                return;
++            authorizing = true;
++            let allowed = false;
++            try {
++                allowed = filterSsh ? await filterSsh(port, host) : false;
++            }
++            catch {
++                allowed = false;
++            }
++            finish(allowed);
++        };
++        const inspectClient = () => {
++            if (pendingClient.length < SSH_IDENTIFICATION_PREFIX.length)
++                return;
++            if (pendingClient.subarray(0, SSH_IDENTIFICATION_PREFIX.length).equals(SSH_IDENTIFICATION_PREFIX)) {
++                void authorize();
++                return;
++            }
++            finish(true);
++        };
++        const inspectUpstream = () => {
++            while (!settled && !authorizing) {
++                const newline = pendingUpstream.indexOf(0x0a);
++                if (newline >= 0) {
++                    const line = pendingUpstream.subarray(0, newline + 1);
++                    if (line.subarray(0, SSH_IDENTIFICATION_PREFIX.length).equals(SSH_IDENTIFICATION_PREFIX)) {
++                        void authorize();
++                        return;
++                    }
++                    client.write(line);
++                    pendingUpstream = pendingUpstream.subarray(newline + 1);
++                    continue;
++                }
++                if (pendingUpstream.length === 0)
++                    return;
++                const first = pendingUpstream[0];
++                const startsTextLine = first === 0x09 || first === 0x0d || (first >= 0x20 && first <= 0x7e);
++                if (!startsTextLine || pendingUpstream.length > SSH_IDENTIFICATION_MAX_BYTES) finish(true);
++                return;
++            }
++        };
++        const readAvailable = (socket, side) => {
++            let chunk;
++            while ((chunk = socket.read()) !== null) {
++                if (side === 'client') {
++                    pendingClient = pendingClient.length ? Buffer.concat([pendingClient, chunk]) : chunk;
++                    inspectClient();
++                }
++                else {
++                    pendingUpstream = pendingUpstream.length ? Buffer.concat([pendingUpstream, chunk]) : chunk;
++                    inspectUpstream();
++                }
++                if (settled || authorizing)
++                    return;
++            }
++        };
++        const onClientReadable = () => readAvailable(client, 'client');
++        const onUpstreamReadable = () => readAvailable(upstream, 'upstream');
++        const onClose = () => finish(false);
++        client.on('readable', onClientReadable);
++        upstream.on('readable', onUpstreamReadable);
++        client.once('close', onClose);
++        upstream.once('close', onClose);
++        inspectClient();
++        inspectUpstream();
++        if (!settled && !authorizing) {
++            onClientReadable();
++            onUpstreamReadable();
++        }
++    });
++}
+ export function createHttpProxyServer(options) {
+     const server = createServer();
+     const checkAuth = (got) => {
+@@ -138,10 +246,25 @@
+             }
+             if (!wrote200) {
+                 socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
++                wrote200 = true;
++            }
++            const protocol = await authorizeSshTunnel({
++                client: socket,
++                upstream,
++                clientHead: head,
++                filterSsh: options.filterSsh,
++                host: hostname,
++                port,
++            });
++            if (!protocol.allowed) {
++                logForDebugging(`SSH connection blocked to ${hostname}:${port}`, { level: 'error' });
++                upstream.destroy();
++                socket.destroy();
++                return;
+             }
+-            // Forward any bytes the client sent in the same packet as the CONNECT
+-            // (Node delivers these as the `head` buffer, not via the socket stream),
+-            // plus anything the ClientHello sniff consumed when mitmCA is on.
++            head = protocol.clientHead;
++            if (protocol.upstreamHead.length)
++                socket.write(protocol.upstreamHead);
+             if (head.length)
+                 upstream.write(head);
+             upstream.pipe(socket);
+diff --git a/dist/sandbox/socks-proxy.js b/dist/sandbox/socks-proxy.js
+--- a/dist/sandbox/socks-proxy.js
++++ b/dist/sandbox/socks-proxy.js
+@@ -1,6 +1,7 @@
+ import { createServer } from '@pondwader/socks5-server';
+ import { logForDebugging } from '../utils/debug.js';
+ import { connectViaParentProxy, dialDirect, isValidHost, selectParentProxyUrl, shouldBypassParentProxy, } from './parent-proxy.js';
++import { authorizeSshTunnel } from './http-proxy.js';
+ export function createSocksProxyServer(options) {
+     const socksServer = createServer();
+     if (options.proxyAuthToken) {
+@@ -67,14 +68,32 @@
+             ? connectViaParentProxy(parentUrl, host, port)
+             : dialDirect(host, port);
+         open
+-            .then(upstream => {
++            .then(async upstream => {
+             upstreamRef = upstream;
+             upstream.on('error', () => conn.socket.destroy());
+             if (clientGone) {
+                 upstream.destroy();
+                 return;
+             }
++            conn.socket.pause();
+             sendStatus('REQUEST_GRANTED');
++            const protocol = await authorizeSshTunnel({
++                client: conn.socket,
++                upstream,
++                filterSsh: options.filterSsh,
++                host,
++                port,
++            });
++            if (!protocol.allowed) {
++                logForDebugging(`SSH connection blocked to ${host}:${port}`, { level: 'error' });
++                upstream.destroy();
++                conn.socket.destroy();
++                return;
++            }
++            if (protocol.clientHead.length)
++                upstream.write(protocol.clientHead);
++            if (protocol.upstreamHead.length)
++                conn.socket.write(protocol.upstreamHead);
+             upstream.pipe(conn.socket);
+             conn.socket.pipe(upstream);
+             upstream.on('close', () => conn.socket.destroy());
+diff --git a/dist/sandbox/sandbox-manager.js b/dist/sandbox/sandbox-manager.js
+--- a/dist/sandbox/sandbox-manager.js
++++ b/dist/sandbox/sandbox-manager.js
+@@ -240,6 +240,9 @@
+         const injectCredentials = buildCredentialInjector();
+         httpProxyServer = createHttpProxyServer({
+             filter: (port, host) => filterNetworkRequest(port, host, sandboxAskCallback),
++            filterSsh: sandboxAskCallback
++                ? (port, host) => sandboxAskCallback({ host, port, protocol: 'ssh' })
++                : undefined,
+             getMitmSocketPath,
+             mitmCA,
+             shouldTerminateTLS: shouldTerminateTLSForHost,
+@@ -256,6 +259,9 @@
+         });
+         socksProxyServer = createSocksProxyServer({
+             filter: (port, host) => filterNetworkRequest(port, host, sandboxAskCallback),
++            filterSsh: sandboxAskCallback
++                ? (port, host) => sandboxAskCallback({ host, port, protocol: 'ssh' })
++                : undefined,
+             parentProxy,
+             proxyAuthToken: config?.network.allowUnauthenticatedSocksProxy
+                 ? undefined
+diff --git a/dist/sandbox/http-proxy.d.ts b/dist/sandbox/http-proxy.d.ts
+--- a/dist/sandbox/http-proxy.d.ts
++++ b/dist/sandbox/http-proxy.d.ts
+@@ -6,6 +6,8 @@
+ import type { ResolvedParentProxy } from './parent-proxy.js';
+ export interface HttpProxyServerOptions {
+     filter(port: number, host: string, socket: Socket | Duplex): Promise<boolean> | boolean;
++    /** Gate tunnels whose cleartext identification exchange is SSH. */
++    filterSsh?(port: number, host: string): Promise<boolean> | boolean;
+     /**
+      * Optional function to get the MITM proxy socket path for a given host.
+      * If returns a socket path, the request will be routed through that MITM proxy.
+diff --git a/dist/sandbox/socks-proxy.d.ts b/dist/sandbox/socks-proxy.d.ts
+--- a/dist/sandbox/socks-proxy.d.ts
++++ b/dist/sandbox/socks-proxy.d.ts
+@@ -2,6 +2,8 @@
+ import type { ResolvedParentProxy } from './parent-proxy.js';
+ export interface SocksProxyServerOptions {
+     filter(port: number, host: string): Promise<boolean> | boolean;
++    /** Gate tunnels whose cleartext identification exchange is SSH. */
++    filterSsh?(port: number, host: string): Promise<boolean> | boolean;
+     /**
+      * Optional upstream HTTP proxy. When present, SOCKS CONNECT requests are
+      * tunnelled through the parent's HTTP CONNECT instead of dialing directly.

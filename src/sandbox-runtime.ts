@@ -101,8 +101,21 @@ export function enableNodeEnvProxy(): void {
   if ((major === 22 && minor >= 21) || major >= 24) process.env.NODE_USE_ENV_PROXY ??= "1";
 }
 
-export function createNetworkAskCallback(allowedDomains: string[]): SandboxAskCallback {
-  return async ({ host }) => domainIsAllowed(host, allowedDomains);
+interface RuntimeNetworkRequest {
+  host: string;
+  port: number | undefined;
+  protocol?: "ssh";
+}
+
+export function createNetworkAskCallback(
+  allowedDomains: string[],
+  authorizeSsh?: (host: string) => Promise<boolean>,
+): SandboxAskCallback {
+  const callback = async ({ host, protocol }: RuntimeNetworkRequest): Promise<boolean> => {
+    if (protocol === "ssh") return authorizeSsh ? authorizeSsh(host) : false;
+    return domainIsAllowed(host, allowedDomains);
+  };
+  return callback as SandboxAskCallback;
 }
 
 function managerConfig(config: SandboxConfig, session: SessionAllowances): SandboxRuntimeConfig {
@@ -131,12 +144,13 @@ export async function initializeSandboxOnce(
   shared: RuntimeSharedState,
   config: SandboxConfig,
   session: SessionAllowances,
+  authorizeSsh?: (host: string) => Promise<boolean>,
 ): Promise<void> {
   if (shared.managerInitialized) return;
   if (!shared.initPromise) {
     shared.initPromise = SandboxManager.initialize(
       managerConfig(config, session),
-      createNetworkAskCallback(config.network?.allowedDomains ?? []),
+      createNetworkAskCallback(config.network?.allowedDomains ?? [], authorizeSsh),
     ).then(() => {
       shared.managerInitialized = true;
       enableNodeEnvProxy();
