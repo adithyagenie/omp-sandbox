@@ -5,10 +5,15 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, parse, resolve, sep } from "node:path";
 
 export function extractDomainsFromCommand(command: string): string[] {
-  const urlRegex = /https?:\/\/([a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g;
   const domains = new Set<string>();
-  let match: RegExpExecArray | null;
-  while ((match = urlRegex.exec(command)) !== null) domains.add(match[1]);
+  for (const match of command.matchAll(/https?:\/\/[^\s"'`<>\\]+/gi)) {
+    try {
+      const url = new URL(match[0]);
+      if (url.protocol === "http:" || url.protocol === "https:") domains.add(url.hostname);
+    } catch {
+      // A shell fragment that starts like a URL is not necessarily a valid URL.
+    }
+  }
   return [...domains];
 }
 
@@ -51,6 +56,73 @@ export function shellTokens(source: string): string[] {
   return out;
 }
 
+function stripHeredocBodies(source: string): string {
+  const kept: string[] = [];
+  const pending: Array<{ delimiter: string; stripTabs: boolean }> = [];
+  let active: { delimiter: string; stripTabs: boolean } | undefined;
+  for (const line of source.split(/\r?\n/)) {
+    if (active) {
+      const candidate = active.stripTabs ? line.replace(/^\t+/, "") : line;
+      if (candidate === active.delimiter) active = pending.shift();
+      continue;
+    }
+    kept.push(line);
+    for (const match of line.matchAll(/<<(?!<)(-)?\s*(?:'([^']+)'|"([^"]+)"|\\?([A-Za-z0-9_][A-Za-z0-9_.-]*))/g)) {
+      pending.push({
+        delimiter: match[2] ?? match[3] ?? match[4],
+        stripTabs: match[1] === "-",
+      });
+    }
+    active = pending.shift();
+  }
+  return kept.join("\n");
+}
+
+function shellCommandSegments(source: string): string[] {
+  const segments: string[] = [];
+  let current = "";
+  let quote: string | null = null;
+  let escaped = false;
+  for (const character of stripHeredocBodies(source)) {
+    if (escaped) {
+      current += character;
+      escaped = false;
+      continue;
+    }
+    if (character === "\\") {
+      current += character;
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      current += character;
+      if (character === quote) quote = null;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      current += character;
+      quote = character;
+      continue;
+    }
+    const redirectsFileDescriptor = character === "&" && /[<>]$/.test(current);
+    if (character === "\n" || character === ";" || character === "|" || (character === "&" && !redirectsFileDescriptor)) {
+      if (current.trim()) segments.push(current);
+      current = "";
+      continue;
+    }
+    current += character;
+  }
+  if (current.trim()) segments.push(current);
+  return segments;
+}
+
+function hostFromSshDestination(token: string): string | null {
+  if (/[\s<>&$`(){}[\]]/.test(token) || token.startsWith("-")) return null;
+  const at = token.lastIndexOf("@");
+  const host = at >= 0 ? token.slice(at + 1) : token;
+  return /^[A-Za-z0-9][A-Za-z0-9.\-]*$/.test(host) ? host : null;
+}
+
 export function isHostLike(host: string): boolean {
   return /^[A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,}$/.test(host) || /^(\d{1,3}\.){3}\d{1,3}$/.test(host);
 }
@@ -72,11 +144,16 @@ export function hostFromRemoteToken(token: string): string | null {
 
 export function extractSshTargets(command: string): string[] {
   const targets = new Set<string>();
-  const sshUrl = /ssh:\/\/(?:[^@\s/]+@)?([A-Za-z0-9][A-Za-z0-9.\-]+)/g;
-  let match: RegExpExecArray | null;
-  while ((match = sshUrl.exec(command)) !== null) targets.add(match[1]);
+  for (const match of command.matchAll(/ssh:\/\/[^\s"'`<>\\]+/gi)) {
+    try {
+      const url = new URL(match[0]);
+      if (url.protocol === "ssh:" && url.hostname) targets.add(url.hostname);
+    } catch {
+      // Runtime protocol enforcement remains the security boundary.
+    }
+  }
 
-  for (const segment of command.split(/[\n;|&]+/)) {
+  for (const segment of shellCommandSegments(command)) {
     const tokens = shellTokens(segment);
     if (tokens.length === 0) continue;
     let index = 0;
@@ -90,15 +167,11 @@ export function extractSshTargets(command: string): string[] {
     if (!SSH_BINARIES[binary]) continue;
 
     if (binary === "git") {
-      if (tokens[index + 1] !== "clone") continue;
-      for (let cursor = index + 2; cursor < tokens.length; cursor++) {
+      for (let cursor = index + 1; cursor < tokens.length; cursor++) {
         const token = tokens[cursor];
-        if (token.startsWith("-")) continue;
-        if (!token.includes("://")) {
-          const host = hostFromRemoteToken(token);
-          if (host) targets.add(host);
-        }
-        break;
+        if (!token.includes("@")) continue;
+        const host = hostFromRemoteToken(token);
+        if (host) targets.add(host);
       }
       continue;
     }
@@ -113,15 +186,12 @@ export function extractSshTargets(command: string): string[] {
         if (argumentOptions?.[last] && !token.includes("=") && cursor + 1 < tokens.length) cursor++;
         continue;
       }
-      const host = hostFromRemoteToken(token);
-      if (host) {
-        targets.add(host);
-        if (!scanAll) break;
-      } else if (!scanAll) {
-        const at = token.lastIndexOf("@");
-        targets.add(at >= 0 ? token.slice(at + 1) : token);
-        break;
-      }
+      const host = binary === "ssh" || binary === "sftp"
+        ? hostFromSshDestination(token)
+        : hostFromRemoteToken(token);
+      if (!host) continue;
+      targets.add(host);
+      if (!scanAll) break;
     }
   }
   return [...targets];
