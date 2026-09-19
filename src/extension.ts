@@ -426,8 +426,10 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
         return errorResult(`Sandbox: refusing to restart daemon "${params.name}": it was not started under the sandbox by this process (its broker-stored launch spec is unverified). Use hub op:"stop" then op:"start" to relaunch it sandboxed.`);
       }
       if (params.op === "stop") {
+        const wrapped = params.name ? shared.wrappedDaemons.has(params.name) : false;
         const result = await ctx.invokeTool(params, { signal, onUpdate });
         if (params.name) shared.wrappedDaemons.delete(params.name);
+        if (wrapped) cleanupAfterCommand();
         return result;
       }
       if (params.op !== "start" || !params.application) return ctx.invokeTool(params, { signal, onUpdate });
