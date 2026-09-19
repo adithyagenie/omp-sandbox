@@ -68,11 +68,13 @@ import {
   warnIfAllDomainsAllowed,
   type PermissionChoice,
   type PromptSharedState,
+  type PermissionRequestDetails,
 } from "./ui.ts";
 
 interface ActiveSshContext {
   ctx: ExtensionContext;
   tool: string;
+  request: string;
   deferredHosts: Set<string>;
   openedAt: number;
 }
@@ -186,6 +188,20 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
     return choice === "abort-unavailable" ? "abort" : choice;
   }
 
+  function permissionDetails(
+    ctx: ExtensionContext,
+    tool: string,
+    request: string,
+    reason: string,
+  ): PermissionRequestDetails {
+    return {
+      agent: ctx.hasUI ? undefined : (pi.getSessionName() ?? "unnamed subagent"),
+      tool,
+      request,
+      reason,
+    };
+  }
+
   async function applyDomainChoice(choice: Exclude<PermissionChoice, "abort">, domain: string, cwd: string): Promise<void> {
     if (!shared.session.domains.includes(domain)) shared.session.domains.push(domain);
     if (choice === "project" || choice === "global") addDomainToConfig(choice, cwd, domain);
@@ -213,15 +229,26 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
     domain: string,
     ctx: ExtensionContext,
     tool: string,
+    request: string,
   ): Promise<{ block: true; reason: string } | undefined> {
     const loaded = load(ctx.cwd);
     if (allowsAllNetworkDomains(loaded.config.network)) return undefined;
     const decision = decideHost(ruleLayersForTool(loaded, tool, shared.session).domains, domain);
     if (decision === "allow") return undefined;
-    if (decision === "deny") return { block: true, reason: `Sandbox: network access to "${domain}" denied by policy.` };
-    const choice = await askChoice(ctx, (routed) => promptDomainBlock(routed, domain));
+    if (decision === "deny" && ctx.hasUI) {
+      return { block: true, reason: `Sandbox: network access to "${domain}" denied by policy.` };
+    }
+    const reason = decision === "deny"
+      ? "A deny rule matched in the effective layered network policy."
+      : "No allow rule matched in the effective layered network policy.";
+    const details = permissionDetails(ctx, tool, request, reason);
+    const choice = await askChoice(ctx, (routed) => promptDomainBlock(routed, domain, details));
     if (choice === "abort") return { block: true, reason: `Sandbox: network access to "${domain}" requires confirmation.` };
     await applyDomainChoice(choice, domain, ctx.cwd);
+    const refreshed = load(ctx.cwd);
+    if (decideHost(ruleLayersForTool(refreshed, tool, shared.session).domains, domain) !== "allow") {
+      return { block: true, reason: `Sandbox: network access to "${domain}" remains denied after the grant.` };
+    }
     return undefined;
   }
 
@@ -229,14 +256,25 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
     host: string,
     ctx: ExtensionContext,
     tool: string,
+    request: string,
   ): Promise<{ block: true; reason: string } | undefined> {
     const loaded = load(ctx.cwd);
     const decision = decideHost(ruleLayersForTool(loaded, tool, shared.session).ssh, host);
     if (decision === "allow") return undefined;
-    if (decision === "deny") return { block: true, reason: `Sandbox: ssh to "${host}" denied by ssh.deny.` };
-    const choice = await askChoice(ctx, (routed) => promptSshBlock(routed, host));
+    if (decision === "deny" && ctx.hasUI) {
+      return { block: true, reason: `Sandbox: ssh to "${host}" denied by ssh.deny.` };
+    }
+    const reason = decision === "deny"
+      ? "A deny rule matched in the effective layered SSH policy."
+      : "No SSH allow rule matched; direct SSH requires confirmation.";
+    const details = permissionDetails(ctx, tool, request, reason);
+    const choice = await askChoice(ctx, (routed) => promptSshBlock(routed, host, details));
     if (choice === "abort") return { block: true, reason: `Sandbox: ssh to "${host}" requires confirmation.` };
     await applySshChoice(choice, host, ctx.cwd);
+    const refreshed = load(ctx.cwd);
+    if (decideHost(ruleLayersForTool(refreshed, tool, shared.session).ssh, host) !== "allow") {
+      return { block: true, reason: `Sandbox: ssh to "${host}" remains denied after the grant.` };
+    }
     return undefined;
   }
 
@@ -255,13 +293,13 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
     const loaded = load(active.ctx.cwd);
     const decision = decideHost(ruleLayersForTool(loaded, active.tool, shared.session).ssh, host);
     if (decision === "allow") return true;
-    if (decision === "prompt") active.deferredHosts.add(host);
+    if (decision === "prompt" || (decision === "deny" && !active.ctx.hasUI)) active.deferredHosts.add(host);
     return false;
   }
 
   async function promptDeferredSshHosts(active: ActiveSshContext): Promise<void> {
     for (const host of active.deferredHosts) {
-      const block = await enforceSshHostGate(host, active.ctx, active.tool);
+      const block = await enforceSshHostGate(host, active.ctx, active.tool, active.request);
       if (block) continue;
       const ui = active.ctx.hasUI ? active.ctx.ui : shared.mainUi;
       ui?.notify(`SSH access to "${host}" granted. Retry the command.`, "info");
@@ -272,9 +310,10 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
     id: string,
     ctx: ExtensionContext,
     tool: string,
+    request: string,
     run: () => Promise<TResult>,
   ): Promise<TResult> {
-    const active: ActiveSshContext = { ctx, tool, openedAt: Date.now(), deferredHosts: new Set() };
+    const active: ActiveSshContext = { ctx, tool, request, openedAt: Date.now(), deferredHosts: new Set() };
     shared.sshContexts.set(id, active);
     try {
       return await run();
@@ -291,12 +330,13 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
     ctx: ExtensionContext,
     tool: string,
   ): Promise<{ block: true; reason: string } | undefined> {
+    const request = `${tool}: ${command}`;
     for (const domain of extractDomainsFromCommand(command)) {
-      const block = await enforceDomainGate(domain, ctx, tool);
+      const block = await enforceDomainGate(domain, ctx, tool, request);
       if (block) return block;
     }
     for (const host of extractSshTargets(command)) {
-      const block = await enforceSshHostGate(host, ctx, tool);
+      const block = await enforceSshHostGate(host, ctx, tool, request);
       if (block) return block;
     }
     return undefined;
@@ -332,7 +372,7 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
       refreshMainUi(ctx);
       const cwd = params.cwd ?? ctx.cwd;
       const run = async (): Promise<AgentToolResult<unknown>> =>
-        withRuntimeSshContext(_toolCallId, ctx, "bash", async () => {
+        withRuntimeSshContext(_toolCallId, ctx, "bash", `bash: ${params.command}`, async () => {
           try {
             return toToolResult(await runSandboxedShell(params.command, cwd, bashShellPath(), {
               signal,
@@ -355,7 +395,13 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
       const output = result.content.filter((content) => content.type === "text").map((content) => content.text).join("\n");
       const blockedPath = extractBlockedWritePath(output);
       if (!blockedPath) return result;
-      const choice = await askChoice(ctx, (routed) => promptWriteBlock(routed, blockedPath));
+      const details = permissionDetails(
+        ctx,
+        "bash",
+        `bash: ${params.command}`,
+        "The OS sandbox reported a write blocked by the effective write policy.",
+      );
+      const choice = await askChoice(ctx, (routed) => promptWriteBlock(routed, blockedPath, details));
       if (choice === "abort") return result;
       await applyWriteChoice(choice, blockedPath, ctx.cwd);
       const loaded = load(ctx.cwd);
@@ -424,6 +470,7 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
         _toolCallId,
         ctx,
         "hub",
+        `hub start: ${shellQuoteJoin(argv)}`,
         () => ctx.invokeTool({ ...params, application: bashShellPath(), args: ["-c", wrapped] }, { signal, onUpdate }),
       );
       if (params.name) shared.wrappedDaemons.add(params.name);
@@ -450,9 +497,20 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
         }
       }
       if (decision === "prompt") {
-        const choice = await askChoice(ctx, (routed) => promptReadBlock(routed, path));
+        const details = permissionDetails(
+          ctx,
+          "read",
+          `input attachment: ${rawTarget}`,
+          "No read allow rule matched the attachment path.",
+        );
+        const choice = await askChoice(ctx, (routed) => promptReadBlock(routed, path, details));
         if (choice === "abort") return { action: "handled" as const };
         await applyReadChoice(choice, path, ctx.cwd);
+        const refreshed = load(ctx.cwd);
+        if (decidePath(ruleLayersForTool(refreshed, "read", shared.session).read, target.path, ctx.cwd, true) !== "allow") {
+          if (ctx.hasUI) ctx.ui.notify(`"${path}" remains denied after the grant.`, "warning");
+          return { action: "handled" as const };
+        }
       }
     }
   }));
@@ -466,7 +524,7 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
       return { result: { output, exitCode: 1, cancelled: false, truncated: false, ...outputStats(output) } };
     }
     const id = `user-bash:${++shared.sshContextSequence}`;
-    return withRuntimeSshContext(id, ctx, "bash", async () => {
+    return withRuntimeSshContext(id, ctx, "bash", `bash: ${event.command}`, async () => {
       try {
         const run = await runSandboxedShell(event.command, ctx.cwd, bashShellPath(), {
           wrap: true,
@@ -495,41 +553,63 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
     for (const rawTarget of collectReadTargets(tool, input)) {
       const target = classifyToolPath(rawTarget);
       if (target.kind === "internal") continue;
+      const request = `${tool} read target: ${rawTarget}`;
       if (target.kind === "url") {
-        const block = await enforceDomainGate(target.domain, ctx, tool);
+        const block = await enforceDomainGate(target.domain, ctx, tool, request);
         if (block) return block;
         continue;
       }
       if (target.kind === "ssh") {
-        const block = await enforceSshHostGate(target.host, ctx, tool);
+        const block = await enforceSshHostGate(target.host, ctx, tool, request);
         if (block) return block;
         continue;
       }
       const path = canonicalizePath(target.path, ctx.cwd);
       const decision = decidePath(ruleLayersForTool(loaded, tool, shared.session).read, target.path, ctx.cwd, true);
-      if (decision === "deny") return { block: true, reason: `Sandbox: read access denied for "${path}" (denied by policy).` };
-      if (decision === "prompt") {
-        const choice = await askChoice(ctx, (routed) => promptReadBlock(routed, path));
+      if (decision === "deny" && ctx.hasUI) {
+        return { block: true, reason: `Sandbox: read access denied for "${path}" (denied by policy).` };
+      }
+      if (decision !== "allow") {
+        const reason = decision === "deny"
+          ? "A deny rule matched in the effective layered read policy."
+          : "No allow rule matched in the effective layered read policy.";
+        const details = permissionDetails(ctx, tool, request, reason);
+        const choice = await askChoice(ctx, (routed) => promptReadBlock(routed, path, details));
         if (choice === "abort") return { block: true, reason: `Sandbox: read access denied for "${path}".` };
         await applyReadChoice(choice, path, ctx.cwd);
+        const refreshed = load(ctx.cwd);
+        if (decidePath(ruleLayersForTool(refreshed, tool, shared.session).read, target.path, ctx.cwd, true) !== "allow") {
+          return { block: true, reason: `Sandbox: read access to "${path}" remains denied after the grant.` };
+        }
       }
     }
 
     for (const rawTarget of collectWriteTargets(tool, input)) {
       const target = classifyToolPath(rawTarget);
       if (target.kind === "internal" || target.kind === "url") continue;
+      const request = `${tool} write target: ${rawTarget}`;
       if (target.kind === "ssh") {
-        const block = await enforceSshHostGate(target.host, ctx, tool);
+        const block = await enforceSshHostGate(target.host, ctx, tool, request);
         if (block) return block;
         continue;
       }
       const path = canonicalizePath(target.path, ctx.cwd);
       const decision = decidePath(ruleLayersForTool(loaded, tool, shared.session).write, target.path, ctx.cwd);
-      if (decision === "deny") return { block: true, reason: `Sandbox: write access denied for "${path}" (denied by policy).` };
-      if (decision === "prompt") {
-        const choice = await askChoice(ctx, (routed) => promptWriteBlock(routed, path));
+      if (decision === "deny" && ctx.hasUI) {
+        return { block: true, reason: `Sandbox: write access denied for "${path}" (denied by policy).` };
+      }
+      if (decision !== "allow") {
+        const reason = decision === "deny"
+          ? "A deny rule matched in the effective layered write policy."
+          : "No allow rule matched in the effective layered write policy.";
+        const details = permissionDetails(ctx, tool, request, reason);
+        const choice = await askChoice(ctx, (routed) => promptWriteBlock(routed, path, details));
         if (choice === "abort") return { block: true, reason: `Sandbox: write access denied for "${path}".` };
         await applyWriteChoice(choice, path, ctx.cwd);
+        const refreshed = load(ctx.cwd);
+        if (decidePath(ruleLayersForTool(refreshed, tool, shared.session).write, target.path, ctx.cwd) !== "allow") {
+          return { block: true, reason: `Sandbox: write access to "${path}" remains denied after the grant.` };
+        }
       }
     }
 
@@ -537,7 +617,8 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
       try {
         await prepareLaunch("eval", loaded);
         openLaunchWindow(shared.launchGuard, event.toolCallId, "eval");
-        shared.sshContexts.set(event.toolCallId, { ctx, tool, openedAt: Date.now(), deferredHosts: new Set() });
+        const request = `eval: ${JSON.stringify({ language: input.language, title: input.title })}`;
+        shared.sshContexts.set(event.toolCallId, { ctx, tool, request, openedAt: Date.now(), deferredHosts: new Set() });
       } catch (error) {
         return { block: true, reason: `Sandbox: failed to prepare eval sandbox: ${error instanceof Error ? error.message : error}. Retry the tool call.` };
       }
@@ -550,7 +631,8 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
         try {
           await prepareLaunch("device", loaded);
           openLaunchWindow(shared.launchGuard, event.toolCallId, "device");
-          shared.sshContexts.set(event.toolCallId, { ctx, tool, openedAt: Date.now(), deferredHosts: new Set() });
+          const request = `write device: ${event.input.path}`;
+          shared.sshContexts.set(event.toolCallId, { ctx, tool, request, openedAt: Date.now(), deferredHosts: new Set() });
         } catch (error) {
           return { block: true, reason: `Sandbox: failed to prepare the OS sandbox for xd://${device} launches: ${error instanceof Error ? error.message : error}. Retry the tool call.` };
         }

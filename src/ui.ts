@@ -14,6 +14,23 @@ export interface PromptOption {
   hint?: string;
 }
 
+export interface PermissionRequestDetails {
+  agent?: string;
+  tool: string;
+  request: string;
+  reason: string;
+}
+
+interface PermissionGrantDetails {
+  sessionKey: keyof SessionAllowances;
+  configPath: string;
+  value: string;
+}
+
+interface PermissionPromptDetails extends PermissionRequestDetails {
+  grant: PermissionGrantDetails;
+}
+
 export const PERMISSION_OPTIONS: PromptOption[] = [
   { label: "Allow for this session only", key: "s", action: "session" },
   { label: "Abort (keep blocked)", key: "esc", action: "abort" },
@@ -57,16 +74,30 @@ export async function routePrompt<T>(
 export async function showPermissionPrompt(
   ctx: ExtensionContext,
   title: string,
+  details?: PermissionPromptDetails,
   options: PromptOption[] = PERMISSION_OPTIONS,
 ): Promise<PermissionChoice> {
   if (!ctx.hasUI) return "abort";
-  const routedTitle = (ctx as RoutedContext)[SUBAGENT_CONTEXT] ? `[subagent] ${title}` : title;
+  const isSubagent = (ctx as RoutedContext)[SUBAGENT_CONTEXT] === true;
+  const routedTitle = isSubagent ? `[subagent] ${title}` : title;
   const globalPath = getGlobalConfigPath();
   const projectKey = canonicalizePath(ctx.cwd);
   const displayedOptions = options.map((option) => {
-    if (option.action === "project") return { ...option, hint: `→ projects[${JSON.stringify(projectKey)}] in ${globalPath}` };
-    if (option.action === "global") return { ...option, hint: `→ ${globalPath}` };
-    return option;
+    if (!details) return option;
+    const value = JSON.stringify(details.grant.value);
+    if (option.action === "session") {
+      return { ...option, hint: `→ add ${value} to session.${details.grant.sessionKey}` };
+    }
+    if (option.action === "project") {
+      return {
+        ...option,
+        hint: `→ add ${value} to projects[${JSON.stringify(projectKey)}].${details.grant.configPath} in ${globalPath}`,
+      };
+    }
+    if (option.action === "global") {
+      return { ...option, hint: `→ add ${value} to ${details.grant.configPath} in ${globalPath}` };
+    }
+    return { ...option, hint: "→ no policy change" };
   });
 
   const result = await ctx.ui.custom<PermissionChoice>((tui, theme, _keyboard, done) => {
@@ -74,7 +105,16 @@ export async function showPermissionPrompt(
     let pendingAction: PermissionChoice | null = null;
     return {
       render(width: number): string[] {
-        const lines = [truncateToWidth(theme.fg("warning", routedTitle), width), ""];
+        const lines = [truncateToWidth(theme.fg("warning", routedTitle), width)];
+        if (details) {
+          if (details.agent) lines.push(truncateToWidth(`Agent: ${details.agent}`, width));
+          lines.push(
+            truncateToWidth(`Tool: ${details.tool}`, width),
+            truncateToWidth(`Request: ${details.request}`, width),
+            truncateToWidth(`Why blocked: ${details.reason}`, width),
+          );
+        }
+        lines.push("");
         for (let index = 0; index < displayedOptions.length; index++) {
           const option = displayedOptions[index];
           const prefix = index === selectedIndex ? " → " : "   ";
@@ -131,20 +171,48 @@ export async function showPermissionPrompt(
   return result ?? "abort";
 }
 
-export function promptDomainBlock(ctx: ExtensionContext, domain: string): Promise<PermissionChoice> {
-  return showPermissionPrompt(ctx, `🌐 Network blocked: "${domain}" is not in allowedDomains`);
+export function promptDomainBlock(
+  ctx: ExtensionContext,
+  domain: string,
+  details: PermissionRequestDetails,
+): Promise<PermissionChoice> {
+  return showPermissionPrompt(ctx, `🌐 Network blocked: "${domain}"`, {
+    ...details,
+    grant: { sessionKey: "domains", configPath: "network.allowedDomains", value: domain },
+  });
 }
 
-export function promptReadBlock(ctx: ExtensionContext, path: string): Promise<PermissionChoice> {
-  return showPermissionPrompt(ctx, `📖 Read blocked: "${path}" is not in allowRead`);
+export function promptReadBlock(
+  ctx: ExtensionContext,
+  path: string,
+  details: PermissionRequestDetails,
+): Promise<PermissionChoice> {
+  return showPermissionPrompt(ctx, `📖 Read blocked: "${path}"`, {
+    ...details,
+    grant: { sessionKey: "read", configPath: "filesystem.allowRead", value: path },
+  });
 }
 
-export function promptWriteBlock(ctx: ExtensionContext, path: string): Promise<PermissionChoice> {
-  return showPermissionPrompt(ctx, `📝 Write blocked: "${path}" is not in allowWrite`);
+export function promptWriteBlock(
+  ctx: ExtensionContext,
+  path: string,
+  details: PermissionRequestDetails,
+): Promise<PermissionChoice> {
+  return showPermissionPrompt(ctx, `📝 Write blocked: "${path}"`, {
+    ...details,
+    grant: { sessionKey: "write", configPath: "filesystem.allowWrite", value: path },
+  });
 }
 
-export function promptSshBlock(ctx: ExtensionContext, host: string): Promise<PermissionChoice> {
-  return showPermissionPrompt(ctx, `🔐 SSH blocked: "${host}" requires confirmation`);
+export function promptSshBlock(
+  ctx: ExtensionContext,
+  host: string,
+  details: PermissionRequestDetails,
+): Promise<PermissionChoice> {
+  return showPermissionPrompt(ctx, `🔐 SSH blocked: "${host}"`, {
+    ...details,
+    grant: { sessionKey: "ssh", configPath: "ssh.allow", value: host },
+  });
 }
 
 export function warnIfAllDomainsAllowed(ctx: ExtensionContext, config: SandboxConfig): void {
