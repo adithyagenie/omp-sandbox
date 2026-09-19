@@ -1,8 +1,7 @@
 diff --git a/dist/sandbox/sandbox-utils.js b/dist/sandbox/sandbox-utils.js
-index a724be479a1e47facc5069003d2cdc05624ff765..20211cbd8bcf7ff90c542a658fe787aa3d48b471 100644
 --- a/dist/sandbox/sandbox-utils.js
 +++ b/dist/sandbox/sandbox-utils.js
-@@ -21,7 +21,7 @@ export const DANGEROUS_FILES = [
+@@ -21,7 +21,7 @@
   * Dangerous directories that should be protected from writes.
   * These directories contain sensitive configuration or executable files.
   */
@@ -11,7 +10,7 @@ index a724be479a1e47facc5069003d2cdc05624ff765..20211cbd8bcf7ff90c542a658fe787aa
  /**
   * Get the list of dangerous directories to deny writes to.
   */
-@@ -314,10 +314,10 @@ export function getDefaultWritePaths() {
+@@ -314,10 +314,10 @@
          '/dev/tty',
          '/dev/dtracehelper',
          '/dev/autofs_nowait',
@@ -147,6 +146,10 @@ diff --git a/dist/sandbox/http-proxy.js b/dist/sandbox/http-proxy.js
              }
              if (!wrote200) {
                  socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+-            }
+-            // Forward any bytes the client sent in the same packet as the CONNECT
+-            // (Node delivers these as the `head` buffer, not via the socket stream),
+-            // plus anything the ClientHello sniff consumed when mitmCA is on.
 +                wrote200 = true;
 +            }
 +            const protocol = await authorizeSshTunnel({
@@ -162,10 +165,7 @@ diff --git a/dist/sandbox/http-proxy.js b/dist/sandbox/http-proxy.js
 +                upstream.destroy();
 +                socket.destroy();
 +                return;
-             }
--            // Forward any bytes the client sent in the same packet as the CONNECT
--            // (Node delivers these as the `head` buffer, not via the socket stream),
--            // plus anything the ClientHello sniff consumed when mitmCA is on.
++            }
 +            head = protocol.clientHead;
 +            if (protocol.upstreamHead.length)
 +                socket.write(protocol.upstreamHead);
@@ -264,3 +264,309 @@ diff --git a/dist/sandbox/socks-proxy.d.ts b/dist/sandbox/socks-proxy.d.ts
      /**
       * Optional upstream HTTP proxy. When present, SOCKS CONNECT requests are
       * tunnelled through the parent's HTTP CONNECT instead of dialing directly.
+diff --git a/dist/sandbox/linux-sandbox-utils.js b/dist/sandbox/linux-sandbox-utils.js
+--- a/dist/sandbox/linux-sandbox-utils.js
++++ b/dist/sandbox/linux-sandbox-utils.js
+@@ -229,11 +229,11 @@
+     }
+     return [...new Set(denyPaths)];
+ }
+-// Track mount points created by bwrap for non-existent deny paths.
+-// When bwrap does --ro-bind /dev/null /nonexistent/path, it creates an empty
+-// file on the host as a mount point. These persist after bwrap exits and must
+-// be cleaned up explicitly.
+-const bwrapMountPoints = new Set();
++// Missing deny destinations live only in temporary overlay lowerdirs. The
++// writable host tree is the upperdir, so ordinary writes persist without
++// materializing protected names in that tree.
++const bwrapOverlayRoots = new Set();
++const activeOverlayUppers = new Set();
+ // Number of wrapped commands that have been generated but whose cleanup has
+ // not yet run. cleanupBwrapMountPoints() defers file deletion while this is
+ // positive, because deleting a mount point file on the host while another
+@@ -253,64 +253,146 @@
+     });
+     exitHandlerRegistered = true;
+ }
+-/**
+- * Clean up mount point files created by bwrap for non-existent deny paths.
+- *
+- * When protecting non-existent deny paths, bwrap creates empty files on the
+- * host filesystem as mount points for --ro-bind. These files persist after
+- * bwrap exits. This function removes them.
+- *
+- * This should be called after each sandboxed command completes to prevent
+- * ghost dotfiles (e.g. .bashrc, .gitconfig) from appearing in the working
+- * directory. It is also called automatically on process exit as a safety net.
+- *
+- * Each command-completion call decrements the active-sandbox counter incremented by
+- * wrapCommandWithSandboxLinux(). File deletion is deferred until the counter
+- * reaches zero. Deleting a mount point file on the host while another bwrap
+- * instance is still running detaches that instance's bind mount (the dentry
+- * is unhashed, so path lookup no longer finds the mount) and the deny rule
+- * stops applying inside that sandbox.
++function isPathAtOrBelow(candidate, root) {
++    return candidate === root || candidate.startsWith(root.endsWith(path.sep) ? root : root + path.sep);
++}
++function createDenyOverlay(upperPath, allowedWritePaths, overlays, overlayArgs) {
++    const upperReal = fs.realpathSync(upperPath);
++    const existing = overlays.get(upperReal);
++    if (existing)
++        return existing;
++    let redirectDir;
++    try {
++        redirectDir = fs.readFileSync('/sys/module/overlay/parameters/redirect_dir', 'utf8').trim();
++    }
++    catch {
++        throw new Error('Cannot verify overlay redirect_dir safety');
++    }
++    if (redirectDir !== 'N' && redirectDir !== '0') {
++        throw new Error('Cannot enforce missing deny paths safely: overlay redirect_dir is enabled');
++    }
++    for (const activeUpper of activeOverlayUppers) {
++        if (isPathAtOrBelow(upperReal, activeUpper) || isPathAtOrBelow(activeUpper, upperReal)) {
++            throw new Error(`Cannot overlap writable deny overlays: ${upperReal} and ${activeUpper}`);
++        }
++    }
++    const upperDev = fs.statSync(upperReal).dev;
++    const candidates = [...new Set([
++            process.env.OMP_TMPDIR,
++            tmpdir(),
++            path.dirname(upperReal),
++        ].filter(Boolean))];
++    let root;
++    for (const candidate of candidates) {
++        try {
++            const candidateReal = fs.realpathSync(candidate);
++            if (fs.statSync(candidateReal).dev !== upperDev ||
++                allowedWritePaths.some(allowedPath => isPathAtOrBelow(candidateReal, allowedPath))) {
++                continue;
++            }
++            const stagedRoot = fs.mkdtempSync(path.join(candidateReal, '.srt-deny-overlay-'));
++            if (allowedWritePaths.some(allowedPath => isPathAtOrBelow(stagedRoot, allowedPath))) {
++                fs.rmSync(stagedRoot, { recursive: true, force: true });
++                continue;
++            }
++            root = stagedRoot;
++            break;
++        }
++        catch {
++            // Try the next same-filesystem location.
++        }
++    }
++    if (!root) {
++        throw new Error(`Cannot safely stage deny overlay for writable path: ${upperPath}`);
++    }
++    const overlay = {
++        upper: upperReal,
++        lower: path.join(root, 'lower'),
++        work: path.join(root, 'work'),
++        root,
++    };
++    fs.mkdirSync(overlay.lower);
++    fs.mkdirSync(overlay.work);
++    overlays.set(upperReal, overlay);
++    activeOverlayUppers.add(upperReal);
++    bwrapOverlayRoots.add(root);
++    registerExitCleanupHandler();
++    overlayArgs.push(
++        '--bind', overlay.root, overlay.root,
++        '--overlay-src', overlay.lower,
++        '--overlay', overlay.upper, overlay.work, overlay.upper,
++        '--ro-bind', overlay.root, overlay.root,
++    );
++    return overlay;
++}
++function stageMissingDenyPath(missingPath, isDirectory, allowedWritePaths, overlays, overlayArgs) {
++    const upperPath = allowedWritePaths
++        .filter(allowedPath => isPathAtOrBelow(missingPath, allowedPath))
++        .sort((a, b) => a.length - b.length)[0];
++    if (!upperPath) {
++        throw new Error(`Missing deny path is not covered by a writable path: ${missingPath}`);
++    }
++    const overlay = createDenyOverlay(upperPath, allowedWritePaths, overlays, overlayArgs);
++    const relative = path.relative(overlay.upper, missingPath);
++    if (!relative || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) {
++        throw new Error(`Invalid deny overlay destination: ${missingPath}`);
++    }
++    const lowerPath = path.join(overlay.lower, relative);
++    fs.mkdirSync(path.dirname(lowerPath), { recursive: true });
++    if (!fs.existsSync(lowerPath)) {
++        if (isDirectory)
++            fs.mkdirSync(lowerPath);
++        else
++            fs.writeFileSync(lowerPath, '', { mode: 0o000 });
++    }
++    const staged = fs.lstatSync(lowerPath);
++    if (isDirectory && !staged.isDirectory()) {
++        throw new Error(`Deny overlay type conflict at: ${missingPath}`);
++    }
++    return {
++        source: staged.isDirectory() ? lowerPath : '/dev/null',
++        dest: missingPath,
++    };
++}
++/**
++ * Clean up temporary deny-overlay lower/work directories.
++ *
++ * Each command-completion call decrements the active-sandbox counter incremented
++ * by wrapCommandWithSandboxLinux(). Cleanup waits for every concurrent sandbox:
++ * active overlay mounts still reference these directories.
+  *
+  * Pass `{ completed: false }` during manager teardown to leave other commands'
+  * counts untouched. `{ force: true }` is reserved for process exit.
+  */
+ export function cleanupBwrapMountPoints(opts) {
++    if (opts?.force && activeSandboxCount > 0) {
++        // bwrap children die with the parent, but may still reference overlay
++        // lower/work directories while process exit handlers are running.
++        return;
++    }
+     if (!opts?.force) {
+         if (opts?.completed !== false && activeSandboxCount > 0) {
+             activeSandboxCount--;
+         }
+         if (activeSandboxCount > 0) {
+-            logForDebugging(`[Sandbox Linux] Deferring mount point cleanup — ${activeSandboxCount} sandbox(es) still active`);
++            logForDebugging(`[Sandbox Linux] Deferring overlay cleanup — ${activeSandboxCount} sandbox(es) still active`);
+             return;
+         }
+     }
+     else {
+         activeSandboxCount = 0;
+     }
+-    for (const mountPoint of bwrapMountPoints) {
++    for (const root of bwrapOverlayRoots) {
+         try {
+-            // Only remove if it's still the empty file/directory bwrap created.
+-            // If something else has written real content, leave it alone.
+-            const stat = fs.statSync(mountPoint);
+-            if (stat.isFile() && stat.size === 0) {
+-                fs.unlinkSync(mountPoint);
+-                logForDebugging(`[Sandbox Linux] Cleaned up bwrap mount point (file): ${mountPoint}`);
+-            }
+-            else if (stat.isDirectory()) {
+-                // Empty directory mount points are created for intermediate
+-                // components (Fix 2). Only remove if still empty.
+-                const entries = fs.readdirSync(mountPoint);
+-                if (entries.length === 0) {
+-                    fs.rmdirSync(mountPoint);
+-                    logForDebugging(`[Sandbox Linux] Cleaned up bwrap mount point (dir): ${mountPoint}`);
+-                }
+-            }
++            fs.rmSync(root, { recursive: true, force: true });
++            logForDebugging(`[Sandbox Linux] Cleaned up deny overlay: ${root}`);
+         }
+         catch {
+-            // Ignore cleanup errors — the file may have already been removed
+-        }
+-    }
+-    bwrapMountPoints.clear();
++            // Best effort during normal cleanup and process exit.
++        }
++    }
++    bwrapOverlayRoots.clear();
++    activeOverlayUppers.clear();
+ }
+ function isExecutable(p) {
+     try {
+@@ -645,6 +727,10 @@
+     // symlink no longer matches them by string prefix. Both spellings name the
+     // same inode once bwrap resolves them, so the comparisons below test both.
+     const denyWriteRawDests = new Map();
++    // Overlay mounts are emitted after read-policy mounts and before denyWrite
++    // binds so tmpfs carve-outs cannot wipe them and every deny has a dentry.
++    const denyOverlayArgs = [];
++    const denyOverlays = new Map();
+     // Determine initial root mount based on write restrictions
+     if (writeConfig) {
+         // Write restrictions: Start with read-only root, then allow writes to specific paths
+@@ -690,6 +776,7 @@
+             ...(writeConfig.denyWithinAllow || []),
+             ...(await linuxGetMandatoryDenyPaths(ripgrepConfig, mandatoryDenySearchDepth, abortSignal)),
+         ];
++        const dangerousDirectoryNames = new Set(getDangerousDirectories().map(normalizeCaseForComparison));
+         // Duplicate deny entries must be collapsed: a duplicate
+         // --ro-bind /dev/null <dest> hits a char device on the second pass and
+         // bwrap's ensure_file() falls through to creat() on a read-only mount.
+@@ -753,53 +840,27 @@
+                 logForDebugging(`[Sandbox Linux] Mounted /dev/null at symlink ${symlinkInPath} to prevent symlink replacement attack`);
+                 continue;
+             }
+-            // Handle non-existent paths by mounting /dev/null to block creation.
+-            // Without this, a sandboxed process could mkdir+write a denied path that
+-            // doesn't exist yet, bypassing the deny rule entirely.
+-            //
+-            // bwrap creates empty files on the host as mount points for these binds.
+-            // We track them in bwrapMountPoints so cleanupBwrapMountPoints() can
+-            // remove them after the command exits.
++            // Bind masks require destination dentries. Stage missing ones in an
++            // overlay lowerdir while the real writable tree remains the upperdir.
+             if (!fs.existsSync(normalizedPath)) {
+-                // Fix 1 (worktree): If any existing component in the deny path is a
+-                // file (not a directory), skip the deny entirely. You can't mkdir
+-                // under a file, so the deny path can never be created. This handles
+-                // git worktrees where .git is a file.
+                 if (hasFileAncestor(normalizedPath)) {
+                     logForDebugging(`[Sandbox Linux] Skipping deny path with file ancestor (cannot create paths under a file): ${normalizedPath}`);
+                     continue;
+                 }
+-                // Find the deepest existing ancestor directory
+                 let ancestorPath = path.dirname(normalizedPath);
+                 while (ancestorPath !== '/' && !fs.existsSync(ancestorPath)) {
+                     ancestorPath = path.dirname(ancestorPath);
+                 }
+-                // Only protect if the existing ancestor is within an allowed write path.
+-                // If not, the path is already read-only from --ro-bind / /.
+-                const ancestorIsWithinAllowedPath = allowedWritePaths.some(allowedPath => ancestorPath.startsWith(allowedPath + '/') ||
+-                    ancestorPath === allowedPath ||
+-                    normalizedPath.startsWith(allowedPath + '/'));
++                const ancestorIsWithinAllowedPath = allowedWritePaths.some(allowedPath => isPathAtOrBelow(ancestorPath, allowedPath) ||
++                    isPathAtOrBelow(normalizedPath, allowedPath));
+                 if (ancestorIsWithinAllowedPath) {
+                     const firstNonExistent = findFirstNonExistentComponent(normalizedPath);
+-                    // Fix 2: If firstNonExistent is an intermediate component (not the
+-                    // leaf deny path itself), mount a read-only empty directory instead
+-                    // of /dev/null. This prevents the component from appearing as a file
+-                    // which breaks tools that expect to traverse it as a directory.
+-                    if (firstNonExistent !== normalizedPath) {
+-                        const emptyDir = fs.mkdtempSync(path.join(tmpdir(), 'claude-empty-'));
+-                        denyWriteArgs.push('--ro-bind', emptyDir, firstNonExistent);
+-                        denyWriteRawDests.set(firstNonExistent, rawPath);
+-                        bwrapMountPoints.add(firstNonExistent);
+-                        registerExitCleanupHandler();
+-                        logForDebugging(`[Sandbox Linux] Mounted empty dir at ${firstNonExistent} to block creation of ${normalizedPath}`);
+-                    }
+-                    else {
+-                        denyWriteArgs.push('--ro-bind', '/dev/null', firstNonExistent);
+-                        denyWriteRawDests.set(firstNonExistent, rawPath);
+-                        bwrapMountPoints.add(firstNonExistent);
+-                        registerExitCleanupHandler();
+-                        logForDebugging(`[Sandbox Linux] Mounted /dev/null at ${firstNonExistent} to block creation of ${normalizedPath}`);
+-                    }
++                    const isDirectory = firstNonExistent !== normalizedPath ||
++                        dangerousDirectoryNames.has(normalizeCaseForComparison(path.basename(firstNonExistent)));
++                    const staged = stageMissingDenyPath(firstNonExistent, isDirectory, allowedWritePaths, denyOverlays, denyOverlayArgs);
++                    denyWriteArgs.push('--ro-bind', staged.source, staged.dest);
++                    denyWriteRawDests.set(staged.dest, rawPath);
++                    logForDebugging(`[Sandbox Linux] Staged missing deny path in overlay: ${firstNonExistent}`);
+                 }
+                 else {
+                     logForDebugging(`[Sandbox Linux] Skipping non-existent deny path not within allowed paths: ${normalizedPath}`);
+@@ -905,6 +966,16 @@
+     // writable from inside the sandbox. Adding the dest to maskedFiles
+     // ensures a later denyWrite ro-bind over the same path doesn't undo
+     // the mask.
++    for (const overlay of denyOverlays.values()) {
++        const readDirConflict = tmpfsDirs.find(readPath => isPathAtOrBelow(readPath, overlay.upper));
++        const readFileConflict = [...maskedFiles.keys()].find(readPath => isPathAtOrBelow(readPath, overlay.upper));
++        if (readDirConflict || readFileConflict) {
++            throw new Error(`Cannot safely combine a writable deny overlay at ${overlay.upper} with nested read deny ${readDirConflict ?? readFileConflict}`);
++        }
++    }
++    // Overlay writable roots only after every read-policy tmpfs/rebind. File
++    // credential masks and denyWrite binds then stack on the overlay.
++    args.push(...denyOverlayArgs);
+     for (const { realPath, fakePath } of maskedFileBinds ?? []) {
+         const dest = resolveSymlinkDenyDest(realPath);
+         args.push('--ro-bind', fakePath, dest);
