@@ -570,3 +570,21 @@ diff --git a/dist/sandbox/linux-sandbox-utils.js b/dist/sandbox/linux-sandbox-ut
      for (const { realPath, fakePath } of maskedFileBinds ?? []) {
          const dest = resolveSymlinkDenyDest(realPath);
          args.push('--ro-bind', fakePath, dest);
+diff --git a/dist/index.js b/dist/index.js
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -9 +9 @@
+-export { getDefaultWritePaths } from './sandbox/sandbox-utils.js';
++export { DANGEROUS_FILES, getDangerousDirectories, getDefaultWritePaths } from './sandbox/sandbox-utils.js';
+diff --git a/dist/index.d.ts b/dist/index.d.ts
+--- a/dist/index.d.ts
++++ b/dist/index.d.ts
+@@ -13 +13 @@
+-export { getDefaultWritePaths } from './sandbox/sandbox-utils.js';
++export { DANGEROUS_FILES, getDangerousDirectories, getDefaultWritePaths } from './sandbox/sandbox-utils.js';
+diff --git a/dist/sandbox/sandbox-utils.d.ts b/dist/sandbox/sandbox-utils.d.ts
+--- a/dist/sandbox/sandbox-utils.d.ts
++++ b/dist/sandbox/sandbox-utils.d.ts
+@@ -10 +10 @@
+-export declare const DANGEROUS_DIRECTORIES: readonly [];
++export declare const DANGEROUS_DIRECTORIES: readonly [".omp"];

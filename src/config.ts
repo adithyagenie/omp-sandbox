@@ -1,4 +1,4 @@
-import type { SandboxRuntimeConfig } from "@carderne/sandbox-runtime";
+import { DANGEROUS_FILES, getDangerousDirectories, type SandboxRuntimeConfig } from "@carderne/sandbox-runtime";
 import { existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { getAgentDir } from "@oh-my-pi/pi-coding-agent";
@@ -85,7 +85,15 @@ export const DEFAULT_CONFIG: SandboxConfig = {
     denyRead: ["/Users", "/home", agentDir],
     allowRead: [".", "~/.config", "~/.local", "Library"],
     allowWrite: ["."],
-    denyWrite: [".env", ".env.*", "*.pem", "*.key", agentDir],
+    denyWrite: [
+      ".env",
+      ".env.*",
+      "*.pem",
+      "*.key",
+      ...DANGEROUS_FILES,
+      ...getDangerousDirectories(),
+      agentDir,
+    ],
   },
   sandboxedDevices: [...DEFAULT_SANDBOXED_DEVICES],
   ssh: { allow: [], deny: [] },
@@ -412,12 +420,15 @@ export function ruleLayersForTool(
 ): { read: PathRuleScope[]; write: PathRuleScope[]; domains: RuleLayer[]; ssh: RuleLayer[] } {
   const globalTool = tool ? raw.globalSection.tools?.[tool] : undefined;
   const projectTool = tool ? raw.projectSection.tools?.[tool] : undefined;
+  const mandatoryWriteDeny = [...DANGEROUS_FILES, ...getDangerousDirectories()];
   const buildPaths = (
     sessionList: string[],
     allow: (section: SandboxConfig | ToolPolicyOverride | undefined) => string[] | undefined,
     deny: (section: SandboxConfig | ToolPolicyOverride | undefined) => string[] | undefined,
+    mandatoryDeny: string[] = [],
   ): PathRuleScope[] => [
     { allow: sessionList, deny: [] },
+    { allow: [], deny: mandatoryDeny },
     { allow: allow(projectTool) ?? [], deny: deny(projectTool) ?? [] },
     { allow: allow(raw.projectSection) ?? [], deny: deny(raw.projectSection) ?? [] },
     { allow: allow(globalTool) ?? [], deny: deny(globalTool) ?? [] },
@@ -441,7 +452,12 @@ export function ruleLayersForTool(
   ];
   return {
     read: buildPaths(session.read, (s) => s?.filesystem?.allowRead, (s) => s?.filesystem?.denyRead),
-    write: buildPaths(session.write, (s) => s?.filesystem?.allowWrite, (s) => s?.filesystem?.denyWrite),
+    write: buildPaths(
+      session.write,
+      (s) => s?.filesystem?.allowWrite,
+      (s) => s?.filesystem?.denyWrite,
+      mandatoryWriteDeny,
+    ),
     domains: buildHosts(session.domains, (s) => s?.network?.allowedDomains, (s) => s?.network?.deniedDomains),
     ssh: buildHosts(session.ssh, (s) => s?.ssh?.allow, (s) => s?.ssh?.deny),
   };
