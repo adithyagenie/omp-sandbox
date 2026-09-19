@@ -34,7 +34,7 @@ import {
 import {
   bashShellPath,
   cleanupAfterCommand,
-  ensureLaunchTemplate,
+  createLaunchTemplate,
   ensureSandboxTmpdir,
   getExtensionHandlerTimeoutBridge,
   initializeSandboxOnce,
@@ -77,6 +77,7 @@ interface ActiveSshContext {
   request: string;
   deferredHosts: Set<string>;
   openedAt: number;
+  cleanupSandbox?: true;
 }
 
 interface SharedSandboxState extends RuntimeSharedState, PromptSharedState {
@@ -106,11 +107,7 @@ function getSharedState(): SharedSandboxState {
     launchGuard: getLaunchGuardState(),
     sshContexts: new Map(),
     sshContextSequence: 0,
-    launchGeneration: 0,
-    launchTemplates: new Map(),
-    launchTemplatePromises: new Map(),
     runtimeRawConfig: { globalSection: {}, projectSection: {} },
-    runtimeRawConfigSignature: "",
     mainUi: null,
     promptQueue: Promise.resolve(),
     wrappedDaemons: new Set(),
@@ -157,27 +154,16 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
 
   function load(cwd: string): LoadedConfig {
     const loaded = loadConfig(cwd, shared);
-    const raw = {
+    shared.runtimeRawConfig = {
       globalSection: loaded.globalSection,
       projectSection: loaded.projectSection,
     };
-    const signature = JSON.stringify(raw);
-    if (signature !== shared.runtimeRawConfigSignature) {
-      shared.runtimeRawConfigSignature = signature;
-      shared.launchGeneration += 1;
-      shared.launchTemplates.clear();
-      shared.launchTemplatePromises.clear();
-    }
-    shared.runtimeRawConfig = raw;
     return loaded;
   }
 
   async function updateAfterGrant(cwd: string): Promise<void> {
     const loaded = load(cwd);
     if (shared.managerInitialized) await updateSandboxConfig(loaded.config, shared.session);
-    shared.launchGeneration += 1;
-    shared.launchTemplates.clear();
-    shared.launchTemplatePromises.clear();
   }
 
   async function askChoice(
@@ -346,7 +332,7 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
     scope: "device" | "eval",
     raw: { globalSection: SandboxConfig; projectSection: SandboxConfig },
   ): Promise<string> {
-    const template = await ensureLaunchTemplate(shared, scope, raw);
+    const template = await createLaunchTemplate(shared, scope, raw);
     setLaunchTemplate(shared.launchGuard, scope, template);
     return template;
   }
@@ -614,12 +600,17 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
     }
 
     if (tool === "eval") {
+      let prepared = false;
       try {
         await prepareLaunch("eval", loaded);
+        prepared = true;
         openLaunchWindow(shared.launchGuard, event.toolCallId, "eval");
         const request = `eval: ${JSON.stringify({ language: input.language, title: input.title })}`;
-        shared.sshContexts.set(event.toolCallId, { ctx, tool, request, openedAt: Date.now(), deferredHosts: new Set() });
+        shared.sshContexts.set(event.toolCallId, {
+          ctx, tool, request, openedAt: Date.now(), deferredHosts: new Set(), cleanupSandbox: true,
+        });
       } catch (error) {
+        if (prepared) cleanupAfterCommand();
         return { block: true, reason: `Sandbox: failed to prepare eval sandbox: ${error instanceof Error ? error.message : error}. Retry the tool call.` };
       }
     }
@@ -628,12 +619,17 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
       const device = event.input.path.slice(5).split("/")[0];
       const devices = new Set(loaded.config.sandboxedDevices ?? DEFAULT_SANDBOXED_DEVICES);
       if (device && devices.has(device)) {
+        let prepared = false;
         try {
           await prepareLaunch("device", loaded);
+          prepared = true;
           openLaunchWindow(shared.launchGuard, event.toolCallId, "device");
           const request = `write device: ${event.input.path}`;
-          shared.sshContexts.set(event.toolCallId, { ctx, tool, request, openedAt: Date.now(), deferredHosts: new Set() });
+          shared.sshContexts.set(event.toolCallId, {
+            ctx, tool, request, openedAt: Date.now(), deferredHosts: new Set(), cleanupSandbox: true,
+          });
         } catch (error) {
+          if (prepared) cleanupAfterCommand();
           return { block: true, reason: `Sandbox: failed to prepare the OS sandbox for xd://${device} launches: ${error instanceof Error ? error.message : error}. Retry the tool call.` };
         }
       }
@@ -644,6 +640,7 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
     closeLaunchWindow(shared.launchGuard, event.toolCallId);
     const active = shared.sshContexts.get(event.toolCallId);
     shared.sshContexts.delete(event.toolCallId);
+    if (active?.cleanupSandbox) cleanupAfterCommand();
     if (active) await promptDeferredSshHosts(active);
   };
   pi.on("tool_result", withExtensionHandlerTimeoutBridge(timeoutBridge, async (event) => closeWindow(event)));
@@ -668,9 +665,7 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
     try {
       await initializeSandboxOnce(shared, loaded.config, shared.session, authorizeRuntimeSsh);
       shared.enabled = true;
-      shared.launchGeneration += 1;
       installGuard();
-      prepareLaunch("device", loaded).catch((error: unknown) => console.error(`Warning: failed to warm launch template: ${error}`));
       if (ctx.hasUI) {
         warnIfAllDomainsAllowed(ctx, loaded.config);
         ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", formatSandboxStatus(loaded.config)));
@@ -704,9 +699,7 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
       try {
         await initializeSandboxOnce(shared, loaded.config, shared.session, authorizeRuntimeSsh);
         shared.enabled = true;
-        shared.launchGeneration += 1;
         installGuard();
-        await prepareLaunch("device", loaded);
         ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", formatSandboxStatus(loaded.config)));
         ctx.ui.notify("Sandbox enabled", "info");
       } catch (error) {

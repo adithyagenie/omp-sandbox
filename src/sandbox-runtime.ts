@@ -16,11 +16,7 @@ export interface RuntimeSharedState {
   managerInitialized: boolean;
   initPromise: Promise<void> | null;
   session: SessionAllowances;
-  launchGeneration: number;
-  launchTemplates: Map<string, { generation: number; wrapped: string }>;
-  launchTemplatePromises: Map<string, Promise<string>>;
   runtimeRawConfig: { globalSection: SandboxConfig; projectSection: SandboxConfig };
-  runtimeRawConfigSignature: string;
 }
 
 export const RUNNER_EXTENSION_HANDLER_TIMEOUT_MS = 30_000;
@@ -282,29 +278,14 @@ function filesystemOverride(
   } as SandboxRuntimeConfig;
 }
 
-export async function ensureLaunchTemplate(
+export function createLaunchTemplate(
   shared: RuntimeSharedState,
   scope: "device" | "eval",
   raw = shared.runtimeRawConfig,
 ): Promise<string> {
-  const cacheKey = `${scope}:${JSON.stringify(raw)}`;
-  const cached = shared.launchTemplates.get(cacheKey);
-  if (cached?.generation === shared.launchGeneration) return cached.wrapped;
-  const existing = shared.launchTemplatePromises.get(cacheKey);
-  if (existing) return existing;
-  const generation = shared.launchGeneration;
-  const promise = SandboxManager.wrapWithSandbox(
+  return SandboxManager.wrapWithSandbox(
     `exec ${shellQuoteArg(bashShellPath())} -c "$${LAUNCH_CMD_VAR}"`,
     sandboxShellName(),
     filesystemOverride(shared, raw, scope),
-  ).then((wrapped) => {
-    shared.launchTemplates.set(cacheKey, { generation, wrapped });
-    shared.launchTemplatePromises.delete(cacheKey);
-    return wrapped;
-  }).catch((error: unknown) => {
-    shared.launchTemplatePromises.delete(cacheKey);
-    throw error;
-  });
-  shared.launchTemplatePromises.set(cacheKey, promise);
-  return promise;
+  );
 }
