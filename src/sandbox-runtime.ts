@@ -1,6 +1,6 @@
 import type { AgentToolResult } from "@oh-my-pi/pi-coding-agent";
 import { SandboxManager, type SandboxAskCallback, type SandboxRuntimeConfig } from "@carderne/sandbox-runtime";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import { basename } from "node:path";
 import type { SandboxConfig, SessionAllowances } from "./config.ts";
@@ -191,16 +191,23 @@ export async function runSandboxedShell(
   },
 ): Promise<ShellRunResult> {
   if (!existsSync(cwd)) throw new Error(`Working directory does not exist: ${cwd}`);
-  const wrapped = opts.wrap ?? true
+  const shouldWrap = opts.wrap ?? true;
+  const wrapped = shouldWrap
     ? await SandboxManager.wrapWithSandbox(command, basename(shellPath), opts.customConfig)
     : command;
   const { promise, resolve: resolvePromise, reject } = Promise.withResolvers<ShellRunResult>();
-  const child = spawn(shellPath, ["-c", wrapped], {
-    cwd,
-    env: opts.env ?? process.env,
-    detached: true,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  let child: ChildProcess;
+  try {
+    child = spawn(shellPath, ["-c", wrapped], {
+      cwd,
+      env: opts.env ?? process.env,
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
+    if (shouldWrap) cleanupAfterCommand();
+    throw error;
+  }
   let output = "";
   let timedOut = false;
   let timeoutHandle: NodeJS.Timeout | undefined;
@@ -242,7 +249,8 @@ export async function runSandboxedShell(
     else if (timedOut) reject(new Error(`timeout:${opts.timeout}`));
     else resolvePromise({ exitCode: code, output });
   });
-  return promise;
+  if (!shouldWrap) return promise;
+  return promise.finally(cleanupAfterCommand);
 }
 
 export function toToolResult(run: ShellRunResult): AgentToolResult<unknown> {

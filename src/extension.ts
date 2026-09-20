@@ -87,6 +87,7 @@ interface SharedSandboxState extends RuntimeSharedState, PromptSharedState {
   wrappedDaemons: Set<string>;
   sshContexts: Map<string, ActiveSshContext>;
   sshContextSequence: number;
+  shellQueues: Map<string, Promise<void>>;
   migrationDone: boolean;
 }
 
@@ -106,6 +107,7 @@ function getSharedState(): SharedSandboxState {
     session: { domains: [], read: [], write: [], ssh: [] },
     launchGuard: getLaunchGuardState(),
     sshContexts: new Map(),
+    shellQueues: new Map(),
     sshContextSequence: 0,
     runtimeRawConfig: { globalSection: {}, projectSection: {} },
     mainUi: null,
@@ -115,6 +117,25 @@ function getSharedState(): SharedSandboxState {
   };
   global[SHARED_KEY] = shared;
   return shared;
+}
+
+async function withShellQueue<TResult>(
+  shared: SharedSandboxState,
+  cwd: string,
+  run: () => Promise<TResult>,
+): Promise<TResult> {
+  const key = canonicalizePath(cwd);
+  const previous = shared.shellQueues.get(key) ?? Promise.resolve();
+  const { promise: gate, resolve: release } = Promise.withResolvers<void>();
+  const tail = previous.then(() => gate);
+  shared.shellQueues.set(key, tail);
+  await previous;
+  try {
+    return await run();
+  } finally {
+    release();
+    if (shared.shellQueues.get(key) === tail) shared.shellQueues.delete(key);
+  }
 }
 
 function filesystemConfig(
@@ -357,19 +378,18 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       refreshMainUi(ctx);
       const cwd = params.cwd ?? ctx.cwd;
-      const run = async (): Promise<AgentToolResult<unknown>> =>
-        withRuntimeSshContext(_toolCallId, ctx, "bash", `bash: ${params.command}`, async () => {
-          try {
-            return toToolResult(await runSandboxedShell(params.command, cwd, bashShellPath(), {
-              signal,
-              timeout: params.timeout,
-              wrap: shared.enabled && shared.managerInitialized,
-              customConfig: filesystemConfig(load(cwd), "bash", shared.session),
-            }));
-          } finally {
-            if (shared.enabled && shared.managerInitialized) cleanupAfterCommand();
-          }
-        });
+      const execute = async (): Promise<AgentToolResult<unknown>> =>
+        withRuntimeSshContext(_toolCallId, ctx, "bash", `bash: ${params.command}`, async () =>
+          toToolResult(await runSandboxedShell(params.command, cwd, bashShellPath(), {
+            signal,
+            timeout: params.timeout,
+            wrap: shared.enabled && shared.managerInitialized,
+            customConfig: filesystemConfig(load(cwd), "bash", shared.session),
+          })));
+      const run = (): Promise<AgentToolResult<unknown>> =>
+        shared.enabled && shared.managerInitialized
+          ? withShellQueue(shared, cwd, execute)
+          : execute();
       let result: AgentToolResult<unknown>;
       try {
         result = await run();
@@ -512,17 +532,14 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
       return { result: { output, exitCode: 1, cancelled: false, truncated: false, ...outputStats(output) } };
     }
     const id = `user-bash:${++shared.sshContextSequence}`;
-    return withRuntimeSshContext(id, ctx, "bash", `bash: ${event.command}`, async () => {
-      try {
+    return withShellQueue(shared, ctx.cwd, () =>
+      withRuntimeSshContext(id, ctx, "bash", `bash: ${event.command}`, async () => {
         const run = await runSandboxedShell(event.command, ctx.cwd, bashShellPath(), {
           wrap: true,
           customConfig: filesystemConfig(load(ctx.cwd), "bash", shared.session),
         });
         return { result: { output: run.output, exitCode: run.exitCode ?? 0, cancelled: false, truncated: false, ...outputStats(run.output) } };
-      } finally {
-        cleanupAfterCommand();
-      }
-    });
+      }));
   }));
 
   pi.on("tool_call", withExtensionHandlerTimeoutBridge(timeoutBridge, async (event, ctx) => {
