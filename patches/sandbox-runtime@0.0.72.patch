@@ -1,36 +1,72 @@
-diff --git a/dist/sandbox/sandbox-utils.js b/dist/sandbox/sandbox-utils.js
---- a/dist/sandbox/sandbox-utils.js
-+++ b/dist/sandbox/sandbox-utils.js
-@@ -21,7 +21,7 @@
-  * Dangerous directories that should be protected from writes.
-  * These directories contain sensitive configuration or executable files.
-  */
--export const DANGEROUS_DIRECTORIES = [];
-+export const DANGEROUS_DIRECTORIES = ['.omp'];
- /**
-  * Get the list of dangerous directories to deny writes to.
-  */
-@@ -314,10 +314,10 @@
-         '/dev/tty',
-         '/dev/dtracehelper',
-         '/dev/autofs_nowait',
--        '/tmp/claude',
--        '/private/tmp/claude',
-+        '/tmp/omp',
-+        '/private/tmp/omp',
-         path.join(homeDir, '.npm/_logs'),
--        path.join(homeDir, '.claude/debug'),
-+        path.join(homeDir, '.omp/debug'),
-     ];
-     return recommendedPaths;
+diff --git a/dist/index.d.ts b/dist/index.d.ts
+index 358ebe5..b45bb65 100644
+--- a/dist/index.d.ts
++++ b/dist/index.d.ts
+@@ -10,7 +10,7 @@ export { getSrtWinPath, resolveSrtWin, getWindowsWfpStatus, verifyWindowsWfpEgre
+ export type { WindowsBinShell, WindowsInstallOptions, WindowsInstallResult, WindowsWfpStatus, WindowsAclStampOptions, WindowsAclGrantOptions, WindowsAclAceOutcome, WindowsWfpStatusResult, WindowsWfpVerifyResult, WindowsSandboxUserStatus, SrtWinSpawn, } from './sandbox/windows-sandbox-utils.js';
+ export type { WindowsConfig, SrtWinConfig } from './sandbox/sandbox-config.js';
+ export { WindowsConfigSchema, SrtWinConfigSchema, } from './sandbox/sandbox-config.js';
+-export { getDefaultWritePaths } from './sandbox/sandbox-utils.js';
++export { DANGEROUS_FILES, getDangerousDirectories, getDefaultWritePaths } from './sandbox/sandbox-utils.js';
+ export { getWslVersion } from './utils/platform.js';
+ export type { Platform } from './utils/platform.js';
+ //# sourceMappingURL=index.d.ts.map
+\ No newline at end of file
+diff --git a/dist/index.js b/dist/index.js
+index 186a573..60ac065 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -6,7 +6,7 @@ export { SandboxRuntimeConfigSchema, NetworkConfigSchema, FilesystemConfigSchema
+ export { getSrtWinPath, resolveSrtWin, getWindowsWfpStatus, verifyWindowsWfpEgress, getWindowsSandboxUserStatus, getWindowsSandboxCaCert, windowsTrustCa, installWindowsSandbox, uninstallWindowsSandbox, windowsInstallInstructions, stampWindowsAcl, restoreWindowsAcl, grantWindowsAcl, revokeWindowsAcl, expandWindowsFsPaths, buildGitConfigEnv, parseWindowsBinShell, DEFAULT_WINDOWS_PROXY_PORT_RANGE, SRT_WIN_DISPATCH_ARG1, } from './sandbox/windows-sandbox-utils.js';
+ export { WindowsConfigSchema, SrtWinConfigSchema, } from './sandbox/sandbox-config.js';
+ // Utility functions
+-export { getDefaultWritePaths } from './sandbox/sandbox-utils.js';
++export { DANGEROUS_FILES, getDangerousDirectories, getDefaultWritePaths } from './sandbox/sandbox-utils.js';
+ // Platform utilities
+ export { getWslVersion } from './utils/platform.js';
+ //# sourceMappingURL=index.js.map
+\ No newline at end of file
+diff --git a/dist/sandbox/http-proxy.d.ts b/dist/sandbox/http-proxy.d.ts
+index 0611e6f..dce9d3f 100644
+--- a/dist/sandbox/http-proxy.d.ts
++++ b/dist/sandbox/http-proxy.d.ts
+@@ -6,6 +6,12 @@ import { type FilterRequestCallback, type MutateForwardedHeaders } from './reque
+ import type { ResolvedParentProxy } from './parent-proxy.js';
+ export interface HttpProxyServerOptions {
+     filter(port: number, host: string, socket: Socket | Duplex): Promise<boolean> | boolean;
++    /**
++     * Gate tunnels whose cleartext identification exchange is SSH. Receives
++     * the network context carried by the connection's proxy credentials
++     * (undefined when it carried none).
++     */
++    filterSsh?(port: number, host: string, context?: string): Promise<boolean> | boolean;
+     /**
+      * Optional function to get the MITM proxy socket path for a given host.
+      * If returns a socket path, the request will be routed through that MITM proxy.
+@@ -68,9 +74,11 @@ export interface HttpProxyServerOptions {
+     parentProxy?: ResolvedParentProxy;
+     /**
+      * Per-session bearer token. When set, every CONNECT and absolute-URI
+-     * request must carry `Proxy-Authorization: Basic base64("srt:<token>")`
+-     * or it gets a 407. Without this, any host process can dial 127.0.0.1
+-     * and reach the filter callback.
++     * request must carry `Proxy-Authorization: Basic base64("<username>:<token>")`
++     * or it gets a 407; the password is always this token, while the username
++     * may carry the launch's network context (`srt.<base64url context>`).
++     * Without the token, any host process can dial 127.0.0.1 and reach the
++     * filter callback.
+      */
+     proxyAuthToken?: string;
  }
 diff --git a/dist/sandbox/http-proxy.js b/dist/sandbox/http-proxy.js
+index 08862e0..ce055b8 100644
 --- a/dist/sandbox/http-proxy.js
 +++ b/dist/sandbox/http-proxy.js
-@@ -8,6 +8,114 @@
+@@ -8,17 +8,136 @@ import { CRL_PATH } from './mitm-ca.js';
  import { decideAndRespond, } from './request-filter.js';
  import { peekForClientHello, terminateAndForward, } from './tls-terminate-proxy.js';
  import { connectViaParentProxy, dialDirect, openConnectTunnel, proxyAuthHeader, selectParentProxyUrl, shouldBypassParentProxy, stripBrackets, stripHopByHop, } from './parent-proxy.js';
++import { proxyAuthNetworkContext } from './sandbox-utils.js';
 +const EMPTY = Buffer.alloc(0);
 +const SSH_IDENTIFICATION_PREFIX = Buffer.from('SSH-');
 +const SSH_IDENTIFICATION_MAX_BYTES = 255;
@@ -41,8 +77,12 @@ diff --git a/dist/sandbox/http-proxy.js b/dist/sandbox/http-proxy.js
 + * Direct SSH must exchange a cleartext SSH identification line. Server
 + * pre-banner lines are forwarded while inspection continues; client protocol
 + * bytes that do not start with SSH identify a non-SSH tunnel immediately.
++ *
++ * `filterSsh` is called with the network context decoded from this
++ * connection's proxy credentials (absent when the proxy carries no username
++ * context), so the gate can attribute the tunnel to its launch.
 + */
-+export function authorizeSshTunnel({ client, upstream, clientHead = EMPTY, filterSsh, host, port }) {
++export function authorizeSshTunnel({ client, upstream, clientHead = EMPTY, filterSsh, host, port, context }) {
 +    client.pause();
 +    upstream.pause();
 +    return new Promise(resolve => {
@@ -72,7 +112,7 @@ diff --git a/dist/sandbox/http-proxy.js b/dist/sandbox/http-proxy.js
 +            authorizing = true;
 +            let allowed = false;
 +            try {
-+                allowed = filterSsh ? await filterSsh(port, host) : false;
++                allowed = filterSsh ? await filterSsh(port, host, context) : false;
 +            }
 +            catch {
 +                allowed = false;
@@ -141,15 +181,41 @@ diff --git a/dist/sandbox/http-proxy.js b/dist/sandbox/http-proxy.js
 +}
  export function createHttpProxyServer(options) {
      const server = createServer();
++    // Authenticate a Proxy-Authorization header. The password is the secret
++    // (mandatory whenever a token is configured); the username only carries
++    // the connection's network context, which SSH gating uses for attribution.
++    // Returns the decoded credential on success, or null to reject with 407.
      const checkAuth = (got) => {
-@@ -138,10 +246,25 @@
+         if (!options.proxyAuthToken)
+-            return true;
++            return { context: undefined };
+         const m = /^basic\s+([a-z0-9+/=]+)\s*$/i.exec(got ?? '');
+         if (!m)
+-            return false;
++            return null;
+         const decoded = Buffer.from(m[1], 'base64').toString('utf8');
+         const sep = decoded.indexOf(':');
+-        return sep > 0 && decoded.slice(sep + 1) === options.proxyAuthToken;
++        if (sep <= 0 || decoded.slice(sep + 1) !== options.proxyAuthToken)
++            return null;
++        return { context: proxyAuthNetworkContext(decoded.slice(0, sep)) };
+     };
+     // Handle CONNECT requests for HTTPS traffic
+     server.on('connect', async (req, socket, head) => {
+@@ -32,7 +151,8 @@ export function createHttpProxyServer(options) {
+             clientGone = true;
+         });
+         try {
+-            if (!checkAuth(req.headers['proxy-authorization'])) {
++            const credentials = checkAuth(req.headers['proxy-authorization']);
++            if (!credentials) {
+                 socket.end('HTTP/1.1 407 Proxy Authentication Required\r\n' +
+                     'Proxy-Authenticate: Basic realm="srt"\r\n\r\n');
+                 return;
+@@ -138,10 +258,26 @@ export function createHttpProxyServer(options) {
              }
              if (!wrote200) {
                  socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
--            }
--            // Forward any bytes the client sent in the same packet as the CONNECT
--            // (Node delivers these as the `head` buffer, not via the socket stream),
--            // plus anything the ClientHello sniff consumed when mitmCA is on.
 +                wrote200 = true;
 +            }
 +            const protocol = await authorizeSshTunnel({
@@ -159,136 +225,46 @@ diff --git a/dist/sandbox/http-proxy.js b/dist/sandbox/http-proxy.js
 +                filterSsh: options.filterSsh,
 +                host: hostname,
 +                port,
++                context: credentials.context,
 +            });
 +            if (!protocol.allowed) {
 +                logForDebugging(`SSH connection blocked to ${hostname}:${port}`, { level: 'error' });
 +                upstream.destroy();
 +                socket.destroy();
 +                return;
-+            }
+             }
+-            // Forward any bytes the client sent in the same packet as the CONNECT
+-            // (Node delivers these as the `head` buffer, not via the socket stream),
+-            // plus anything the ClientHello sniff consumed when mitmCA is on.
 +            head = protocol.clientHead;
 +            if (protocol.upstreamHead.length)
 +                socket.write(protocol.upstreamHead);
              if (head.length)
                  upstream.write(head);
              upstream.pipe(socket);
-diff --git a/dist/sandbox/socks-proxy.js b/dist/sandbox/socks-proxy.js
---- a/dist/sandbox/socks-proxy.js
-+++ b/dist/sandbox/socks-proxy.js
-@@ -1,6 +1,7 @@
- import { createServer } from '@pondwader/socks5-server';
- import { logForDebugging } from '../utils/debug.js';
- import { connectViaParentProxy, dialDirect, isValidHost, selectParentProxyUrl, shouldBypassParentProxy, } from './parent-proxy.js';
-+import { authorizeSshTunnel } from './http-proxy.js';
- export function createSocksProxyServer(options) {
-     const socksServer = createServer();
-     if (options.proxyAuthToken) {
-@@ -67,14 +68,32 @@
-             ? connectViaParentProxy(parentUrl, host, port)
-             : dialDirect(host, port);
-         open
--            .then(upstream => {
-+            .then(async upstream => {
-             upstreamRef = upstream;
-             upstream.on('error', () => conn.socket.destroy());
-             if (clientGone) {
-                 upstream.destroy();
-                 return;
-             }
-+            conn.socket.pause();
-             sendStatus('REQUEST_GRANTED');
-+            const protocol = await authorizeSshTunnel({
-+                client: conn.socket,
-+                upstream,
-+                filterSsh: options.filterSsh,
-+                host,
-+                port,
-+            });
-+            if (!protocol.allowed) {
-+                logForDebugging(`SSH connection blocked to ${host}:${port}`, { level: 'error' });
-+                upstream.destroy();
-+                conn.socket.destroy();
-+                return;
-+            }
-+            if (protocol.clientHead.length)
-+                upstream.write(protocol.clientHead);
-+            if (protocol.upstreamHead.length)
-+                conn.socket.write(protocol.upstreamHead);
-             upstream.pipe(conn.socket);
-             conn.socket.pipe(upstream);
-             upstream.on('close', () => conn.socket.destroy());
-diff --git a/dist/sandbox/sandbox-manager.js b/dist/sandbox/sandbox-manager.js
---- a/dist/sandbox/sandbox-manager.js
-+++ b/dist/sandbox/sandbox-manager.js
-@@ -240,6 +240,9 @@
-         const injectCredentials = buildCredentialInjector();
-         httpProxyServer = createHttpProxyServer({
-             filter: (port, host) => filterNetworkRequest(port, host, sandboxAskCallback),
-+            filterSsh: sandboxAskCallback
-+                ? (port, host) => sandboxAskCallback({ host, port, protocol: 'ssh' })
-+                : undefined,
-             getMitmSocketPath,
-             mitmCA,
-             shouldTerminateTLS: shouldTerminateTLSForHost,
-@@ -256,6 +259,9 @@
-         });
-         socksProxyServer = createSocksProxyServer({
-             filter: (port, host) => filterNetworkRequest(port, host, sandboxAskCallback),
-+            filterSsh: sandboxAskCallback
-+                ? (port, host) => sandboxAskCallback({ host, port, protocol: 'ssh' })
-+                : undefined,
-             parentProxy,
-             proxyAuthToken: config?.network.allowUnauthenticatedSocksProxy
-                 ? undefined
-diff --git a/dist/sandbox/http-proxy.d.ts b/dist/sandbox/http-proxy.d.ts
---- a/dist/sandbox/http-proxy.d.ts
-+++ b/dist/sandbox/http-proxy.d.ts
-@@ -6,6 +6,8 @@
- import type { ResolvedParentProxy } from './parent-proxy.js';
- export interface HttpProxyServerOptions {
-     filter(port: number, host: string, socket: Socket | Duplex): Promise<boolean> | boolean;
-+    /** Gate tunnels whose cleartext identification exchange is SSH. */
-+    filterSsh?(port: number, host: string): Promise<boolean> | boolean;
-     /**
-      * Optional function to get the MITM proxy socket path for a given host.
-      * If returns a socket path, the request will be routed through that MITM proxy.
-diff --git a/dist/sandbox/socks-proxy.d.ts b/dist/sandbox/socks-proxy.d.ts
---- a/dist/sandbox/socks-proxy.d.ts
-+++ b/dist/sandbox/socks-proxy.d.ts
-@@ -2,6 +2,8 @@
- import type { ResolvedParentProxy } from './parent-proxy.js';
- export interface SocksProxyServerOptions {
-     filter(port: number, host: string): Promise<boolean> | boolean;
-+    /** Gate tunnels whose cleartext identification exchange is SSH. */
-+    filterSsh?(port: number, host: string): Promise<boolean> | boolean;
-     /**
-      * Optional upstream HTTP proxy. When present, SOCKS CONNECT requests are
-      * tunnelled through the parent's HTTP CONNECT instead of dialing directly.
-diff --git a/dist/sandbox/linux-sandbox-utils.js b/dist/sandbox/linux-sandbox-utils.js
---- a/dist/sandbox/linux-sandbox-utils.js
-+++ b/dist/sandbox/linux-sandbox-utils.js
-@@ -229,11 +229,11 @@
-     }
-     return [...new Set(denyPaths)];
+diff --git a/dist/sandbox/linux-sandbox-utils.d.ts b/dist/sandbox/linux-sandbox-utils.d.ts
+index 606697e..65dd569 100644
+--- a/dist/sandbox/linux-sandbox-utils.d.ts
++++ b/dist/sandbox/linux-sandbox-utils.d.ts
+@@ -61,32 +61,34 @@ export interface LinuxSandboxParams {
+     observeSocketPath?: string;
+     /** Abort signal to cancel the ripgrep scan */
+     abortSignal?: AbortSignal;
++    /**
++     * Opaque token owning this launch's deny-overlay leases. Required when the
++     * wrap stages missing deny paths (i.e. whenever a deny overlay is needed);
++     * release it with releaseDenyOverlayLeases() once the command exits.
++     * SandboxManager produces it via createDenyOverlayCleanupToken().
++     */
++    cleanupToken?: string;
++    /**
++     * Per-launch network context. Rides in the proxy credentials' username so
++     * proxy callbacks can attribute proxied connections (SSH tunnels) to the
++     * launch that spawned them.
++     */
++    networkContext?: string;
  }
--// Track mount points created by bwrap for non-existent deny paths.
--// When bwrap does --ro-bind /dev/null /nonexistent/path, it creates an empty
--// file on the host as a mount point. These persist after bwrap exits and must
--// be cleaned up explicitly.
--const bwrapMountPoints = new Set();
-+// Missing deny destinations live only in temporary overlay lowerdirs. The
-+// writable host tree is the upperdir, so ordinary writes persist without
-+// materializing protected names in that tree.
-+const bwrapOverlayRoots = new Set();
-+const activeOverlayUppers = new Set();
- // Number of wrapped commands that have been generated but whose cleanup has
- // not yet run. cleanupBwrapMountPoints() defers file deletion while this is
- // positive, because deleting a mount point file on the host while another
-@@ -253,64 +253,146 @@
-     });
-     exitHandlerRegistered = true;
- }
--/**
+ /**
 - * Clean up mount point files created by bwrap for non-existent deny paths.
 - *
 - * When protecting non-existent deny paths, bwrap creates empty files on the
@@ -305,14 +281,197 @@ diff --git a/dist/sandbox/linux-sandbox-utils.js b/dist/sandbox/linux-sandbox-ut
 - * instance is still running detaches that instance's bind mount (the dentry
 - * is unhashed, so path lookup no longer finds the mount) and the deny rule
 - * stops applying inside that sandbox.
++ * Mint an opaque cleanup token for one launch's deny-overlay leases.
++ */
++export declare function createDenyOverlayCleanupToken(): string;
++/**
++ * Release the deny-overlay leases held by one launch's cleanup token.
+  *
+- * Pass `{ completed: false }` during manager teardown to leave other commands'
+- * counts untouched. `{ force: true }` is reserved for process exit.
++ * Leases are refcounted and keyed by canonical upper path plus the staged deny
++ * layout signature: concurrent launches with identical layouts share one
++ * root/lower/work tree, and the tree is deleted only when its last holder
++ * releases it. Unknown tokens are ignored, so failure paths may release
++ * unconditionally.
+  */
+-export declare function cleanupBwrapMountPoints(opts?: {
+-    force?: boolean;
+-    completed?: boolean;
+-}): void;
++export declare function releaseDenyOverlayLeases(token?: string): void;
+ /**
+  * Detailed status of Linux sandbox dependencies
+  */
+diff --git a/dist/sandbox/linux-sandbox-utils.js b/dist/sandbox/linux-sandbox-utils.js
+index 81ca091..c9547de 100644
+--- a/dist/sandbox/linux-sandbox-utils.js
++++ b/dist/sandbox/linux-sandbox-utils.js
+@@ -1,7 +1,7 @@
+ import { quote } from '../utils/shell-quote.js';
+ import { logForDebugging } from '../utils/debug.js';
+ import { whichSync } from '../utils/which.js';
+-import { randomBytes } from 'node:crypto';
++import { createHash, randomBytes } from 'node:crypto';
+ import * as fs from 'fs';
+ import { spawn } from 'node:child_process';
+ import { tmpdir } from 'node:os';
+@@ -229,88 +229,227 @@ async function linuxGetMandatoryDenyPaths(ripgrepConfig = { command: 'rg' }, max
+     }
+     return [...new Set(denyPaths)];
+ }
+-// Track mount points created by bwrap for non-existent deny paths.
+-// When bwrap does --ro-bind /dev/null /nonexistent/path, it creates an empty
+-// file on the host as a mount point. These persist after bwrap exits and must
+-// be cleaned up explicitly.
+-const bwrapMountPoints = new Set();
+-// Number of wrapped commands that have been generated but whose cleanup has
+-// not yet run. cleanupBwrapMountPoints() defers file deletion while this is
+-// positive, because deleting a mount point file on the host while another
+-// bwrap instance is still running detaches that instance's bind mount and
+-// the deny rule stops applying inside it.
+-let activeSandboxCount = 0;
+-let exitHandlerRegistered = false;
++// Missing deny destinations live only in temporary overlay lowerdirs. The
++// writable host tree is the upperdir, so ordinary writes persist without
++// materializing protected names in that tree.
++//
++// Overlays are leased, not owned. A lease is keyed by the canonical upper path
++// plus a deterministic signature of the staged deny layout, so concurrent
++// launches that stage the exact same layout share one root/lower/work triple
++// and only the final release deletes it — a completed command can never detach
++// an overlay another sandbox is still using. A different layout for the same
++// upper, or a nested upper, fails closed.
++const denyOverlayLeases = new Map(); // canonical upper -> { signature, root, lower, work, refs }
++const denyOverlayTokens = new Map(); // cleanup token -> Set<canonical upper>
+ /**
+- * Register cleanup handler for bwrap mount points
++ * Opaque token identifying one launch's deny-overlay leases. Every wrapped
++ * command takes a token; releaseDenyOverlayLeases(token) releases exactly that
++ * launch's leases and deletes the roots it held alone.
+  */
+-function registerExitCleanupHandler() {
+-    if (exitHandlerRegistered) {
+-        return;
++export function createDenyOverlayCleanupToken() {
++    return randomBytes(16).toString('hex');
++}
 +function isPathAtOrBelow(candidate, root) {
 +    return candidate === root || candidate.startsWith(root.endsWith(path.sep) ? root : root + path.sep);
 +}
-+function createDenyOverlay(upperPath, allowedWritePaths, overlays, overlayArgs) {
++/**
++ * Deterministic fingerprint of a staged deny layout. Entry kinds and the
++ * sorted relative paths are hashed, so two launches pursuing the same policy
++ * produce the same signature regardless of the order the deny paths were
++ * discovered in (ripgrep match order is not guaranteed stable).
++ */
++function denyLayoutSignature(entries) {
++    const canonical = JSON.stringify([...entries.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)));
++    return createHash('sha256').update(canonical).digest('hex');
++}
++function recordDenyOverlayLease(token, upper) {
++    let uppers = denyOverlayTokens.get(token);
++    if (!uppers) {
++        uppers = new Set();
++        denyOverlayTokens.set(token, uppers);
+     }
+-    process.on('exit', () => {
+-        cleanupBwrapMountPoints({ force: true });
+-    });
+-    exitHandlerRegistered = true;
++    uppers.add(upper);
+ }
+ /**
+- * Clean up mount point files created by bwrap for non-existent deny paths.
+- *
+- * When protecting non-existent deny paths, bwrap creates empty files on the
+- * host filesystem as mount points for --ro-bind. These files persist after
+- * bwrap exits. This function removes them.
+- *
+- * This should be called after each sandboxed command completes to prevent
+- * ghost dotfiles (e.g. .bashrc, .gitconfig) from appearing in the working
+- * directory. It is also called automatically on process exit as a safety net.
+- *
+- * Each command-completion call decrements the active-sandbox counter incremented by
+- * wrapCommandWithSandboxLinux(). File deletion is deferred until the counter
+- * reaches zero. Deleting a mount point file on the host while another bwrap
+- * instance is still running detaches that instance's bind mount (the dentry
+- * is unhashed, so path lookup no longer finds the mount) and the deny rule
+- * stops applying inside that sandbox.
++ * Record one missing deny path in the launch's staged-layout plan.
++ * The plan is keyed by canonical upper and holds each relative deny path plus
++ * whether it must appear as a directory; a path that is a leaf for one deny
++ * rule and an intermediate component for another is staged as a directory
++ * (the merge is an OR, so the signature stays order-independent).
++ */
++function planMissingDenyPath(missingPath, isDirectory, allowedWritePaths, plan) {
++    const upperPath = allowedWritePaths
++        .filter(allowedPath => isPathAtOrBelow(missingPath, allowedPath))
++        .sort((a, b) => a.length - b.length)[0];
++    if (!upperPath) {
++        throw new Error(`Missing deny path is not covered by a writable path: ${missingPath}`);
++    }
++    const upper = fs.realpathSync(upperPath);
++    const relative = path.relative(upper, missingPath);
++    if (!relative || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) {
++        throw new Error(`Invalid deny overlay destination: ${missingPath}`);
++    }
++    let entries = plan.get(upper);
++    if (!entries) {
++        entries = new Map();
++        plan.set(upper, entries);
++    }
++    entries.set(relative, entries.get(relative) === true || isDirectory);
++    return { upper, relative };
++}
++/**
++ * Acquire (or join) the deny-overlay lease for one upper and emit the overlay
++ * mount arguments for it.
+  *
+- * Pass `{ completed: false }` during manager teardown to leave other commands'
+- * counts untouched. `{ force: true }` is reserved for process exit.
++ * The root is created on first use and refcounted from there. Joining an
++ * existing lease requires an identical staged layout: a different layout would
++ * leak this launch's placeholder dentries into a shared lowerdir, so it fails
++ * closed instead. Nested uppers stay fail-closed too — an overlay over an
++ * ancestor and one over a descendant cannot both own the same tree.
+  */
+-export function cleanupBwrapMountPoints(opts) {
+-    if (!opts?.force) {
+-        if (opts?.completed !== false && activeSandboxCount > 0) {
+-            activeSandboxCount--;
++function acquireDenyOverlayLease(token, upperPath, entries, allowedWritePaths, overlayArgs) {
++    if (!token) {
++        throw new Error('Deny overlay leases require a cleanup token; wrap commands through wrapWithSandboxLease()');
++    }
 +    const upperReal = fs.realpathSync(upperPath);
-+    const existing = overlays.get(upperReal);
-+    if (existing)
-+        return existing;
++    const signature = denyLayoutSignature(entries);
++    const active = denyOverlayLeases.get(upperReal);
++    if (active) {
++        if (active.signature !== signature) {
++            throw new Error(`Cannot share writable deny overlay at ${upperReal}: active staged deny layout differs`);
+         }
+-        if (activeSandboxCount > 0) {
+-            logForDebugging(`[Sandbox Linux] Deferring mount point cleanup — ${activeSandboxCount} sandbox(es) still active`);
+-            return;
++        active.refs++;
++        recordDenyOverlayLease(token, upperReal);
++        logForDebugging(`[Sandbox Linux] Sharing deny overlay (${active.refs} leases): ${upperReal}`);
++        overlayArgs.push(
++            '--bind', active.root, active.root,
++            '--overlay-src', active.lower,
++            '--overlay', active.upper, active.work, active.upper,
++            '--ro-bind', active.root, active.root,
++        );
++        return active;
++    }
++    for (const activeUpper of denyOverlayLeases.keys()) {
++        if (isPathAtOrBelow(upperReal, activeUpper) || isPathAtOrBelow(activeUpper, upperReal)) {
++            throw new Error(`Cannot overlap writable deny overlays: ${upperReal} and ${activeUpper}`);
+         }
+     }
+-    else {
+-        activeSandboxCount = 0;
 +    let redirectDir;
 +    try {
 +        redirectDir = fs.readFileSync('/sys/module/overlay/parameters/redirect_dir', 'utf8').trim();
@@ -322,12 +481,8 @@ diff --git a/dist/sandbox/linux-sandbox-utils.js b/dist/sandbox/linux-sandbox-ut
 +    }
 +    if (redirectDir !== 'N' && redirectDir !== '0') {
 +        throw new Error('Cannot enforce missing deny paths safely: overlay redirect_dir is enabled');
-+    }
-+    for (const activeUpper of activeOverlayUppers) {
-+        if (isPathAtOrBelow(upperReal, activeUpper) || isPathAtOrBelow(activeUpper, upperReal)) {
-+            throw new Error(`Cannot overlap writable deny overlays: ${upperReal} and ${activeUpper}`);
-+        }
-+    }
+     }
+-    for (const mountPoint of bwrapMountPoints) {
 +    const upperDev = fs.statSync(upperReal).dev;
 +    const candidates = [...new Set([
 +            process.env.OMP_TMPDIR,
@@ -336,107 +491,6 @@ diff --git a/dist/sandbox/linux-sandbox-utils.js b/dist/sandbox/linux-sandbox-ut
 +        ].filter(Boolean))];
 +    let root;
 +    for (const candidate of candidates) {
-+        try {
-+            const candidateReal = fs.realpathSync(candidate);
-+            if (fs.statSync(candidateReal).dev !== upperDev ||
-+                allowedWritePaths.some(allowedPath => isPathAtOrBelow(candidateReal, allowedPath))) {
-+                continue;
-+            }
-+            const stagedRoot = fs.mkdtempSync(path.join(candidateReal, '.srt-deny-overlay-'));
-+            if (allowedWritePaths.some(allowedPath => isPathAtOrBelow(stagedRoot, allowedPath))) {
-+                fs.rmSync(stagedRoot, { recursive: true, force: true });
-+                continue;
-+            }
-+            root = stagedRoot;
-+            break;
-+        }
-+        catch {
-+            // Try the next same-filesystem location.
-+        }
-+    }
-+    if (!root) {
-+        throw new Error(`Cannot safely stage deny overlay for writable path: ${upperPath}`);
-+    }
-+    const overlay = {
-+        upper: upperReal,
-+        lower: path.join(root, 'lower'),
-+        work: path.join(root, 'work'),
-+        root,
-+    };
-+    fs.mkdirSync(overlay.lower);
-+    fs.mkdirSync(overlay.work);
-+    overlays.set(upperReal, overlay);
-+    activeOverlayUppers.add(upperReal);
-+    bwrapOverlayRoots.add(root);
-+    registerExitCleanupHandler();
-+    overlayArgs.push(
-+        '--bind', overlay.root, overlay.root,
-+        '--overlay-src', overlay.lower,
-+        '--overlay', overlay.upper, overlay.work, overlay.upper,
-+        '--ro-bind', overlay.root, overlay.root,
-+    );
-+    return overlay;
-+}
-+function stageMissingDenyPath(missingPath, isDirectory, allowedWritePaths, overlays, overlayArgs) {
-+    const upperPath = allowedWritePaths
-+        .filter(allowedPath => isPathAtOrBelow(missingPath, allowedPath))
-+        .sort((a, b) => a.length - b.length)[0];
-+    if (!upperPath) {
-+        throw new Error(`Missing deny path is not covered by a writable path: ${missingPath}`);
-+    }
-+    const overlay = createDenyOverlay(upperPath, allowedWritePaths, overlays, overlayArgs);
-+    const relative = path.relative(overlay.upper, missingPath);
-+    if (!relative || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) {
-+        throw new Error(`Invalid deny overlay destination: ${missingPath}`);
-+    }
-+    const lowerPath = path.join(overlay.lower, relative);
-+    fs.mkdirSync(path.dirname(lowerPath), { recursive: true });
-+    if (!fs.existsSync(lowerPath)) {
-+        if (isDirectory)
-+            fs.mkdirSync(lowerPath);
-+        else
-+            fs.writeFileSync(lowerPath, '', { mode: 0o000 });
-+    }
-+    const staged = fs.lstatSync(lowerPath);
-+    if (isDirectory && !staged.isDirectory()) {
-+        throw new Error(`Deny overlay type conflict at: ${missingPath}`);
-+    }
-+    return {
-+        source: staged.isDirectory() ? lowerPath : '/dev/null',
-+        dest: missingPath,
-+    };
-+}
-+/**
-+ * Clean up temporary deny-overlay lower/work directories.
-+ *
-+ * Each command-completion call decrements the active-sandbox counter incremented
-+ * by wrapCommandWithSandboxLinux(). Cleanup waits for every concurrent sandbox:
-+ * active overlay mounts still reference these directories.
-  *
-  * Pass `{ completed: false }` during manager teardown to leave other commands'
-  * counts untouched. `{ force: true }` is reserved for process exit.
-  */
- export function cleanupBwrapMountPoints(opts) {
-+    if (opts?.force && activeSandboxCount > 0) {
-+        // bwrap children die with the parent, but may still reference overlay
-+        // lower/work directories while process exit handlers are running.
-+        return;
-+    }
-     if (!opts?.force) {
-         if (opts?.completed !== false && activeSandboxCount > 0) {
-             activeSandboxCount--;
-         }
-         if (activeSandboxCount > 0) {
--            logForDebugging(`[Sandbox Linux] Deferring mount point cleanup — ${activeSandboxCount} sandbox(es) still active`);
-+            logForDebugging(`[Sandbox Linux] Deferring overlay cleanup — ${activeSandboxCount} sandbox(es) still active`);
-             return;
-         }
-     }
-     else {
-         activeSandboxCount = 0;
-     }
--    for (const mountPoint of bwrapMountPoints) {
-+    for (const root of bwrapOverlayRoots) {
          try {
 -            // Only remove if it's still the empty file/directory bwrap created.
 -            // If something else has written real content, leave it alone.
@@ -444,7 +498,11 @@ diff --git a/dist/sandbox/linux-sandbox-utils.js b/dist/sandbox/linux-sandbox-ut
 -            if (stat.isFile() && stat.size === 0) {
 -                fs.unlinkSync(mountPoint);
 -                logForDebugging(`[Sandbox Linux] Cleaned up bwrap mount point (file): ${mountPoint}`);
--            }
++            const candidateReal = fs.realpathSync(candidate);
++            if (fs.statSync(candidateReal).dev !== upperDev ||
++                allowedWritePaths.some(allowedPath => isPathAtOrBelow(candidateReal, allowedPath))) {
++                continue;
+             }
 -            else if (stat.isDirectory()) {
 -                // Empty directory mount points are created for intermediate
 -                // components (Fix 2). Only remove if still empty.
@@ -453,35 +511,141 @@ diff --git a/dist/sandbox/linux-sandbox-utils.js b/dist/sandbox/linux-sandbox-ut
 -                    fs.rmdirSync(mountPoint);
 -                    logForDebugging(`[Sandbox Linux] Cleaned up bwrap mount point (dir): ${mountPoint}`);
 -                }
--            }
-+            fs.rmSync(root, { recursive: true, force: true });
-+            logForDebugging(`[Sandbox Linux] Cleaned up deny overlay: ${root}`);
++            const stagedRoot = fs.mkdtempSync(path.join(candidateReal, '.srt-deny-overlay-'));
++            if (allowedWritePaths.some(allowedPath => isPathAtOrBelow(stagedRoot, allowedPath))) {
++                fs.rmSync(stagedRoot, { recursive: true, force: true });
++                continue;
+             }
++            root = stagedRoot;
++            break;
          }
          catch {
 -            // Ignore cleanup errors — the file may have already been removed
--        }
--    }
--    bwrapMountPoints.clear();
-+            // Best effort during normal cleanup and process exit.
++            // Try the next same-filesystem location.
 +        }
 +    }
-+    bwrapOverlayRoots.clear();
-+    activeOverlayUppers.clear();
++    if (!root) {
++        throw new Error(`Cannot safely stage deny overlay for writable path: ${upperPath}`);
++    }
++    const lease = {
++        upper: upperReal,
++        signature,
++        root,
++        lower: path.join(root, 'lower'),
++        work: path.join(root, 'work'),
++        refs: 1,
++    };
++    try {
++        fs.mkdirSync(lease.lower);
++        fs.mkdirSync(lease.work);
++        for (const [relative, isDirectory] of entries) {
++            const lowerPath = path.join(lease.lower, relative);
++            fs.mkdirSync(path.dirname(lowerPath), { recursive: true });
++            if (!fs.existsSync(lowerPath)) {
++                if (isDirectory)
++                    fs.mkdirSync(lowerPath);
++                else
++                    fs.writeFileSync(lowerPath, '', { mode: 0o000 });
++            }
++            const staged = fs.lstatSync(lowerPath);
++            if (isDirectory && !staged.isDirectory()) {
++                throw new Error(`Deny overlay type conflict at: ${path.join(upperReal, relative)}`);
++            }
++        }
++    }
++    catch (error) {
++        fs.rmSync(root, { recursive: true, force: true });
++        throw error;
++    }
++    denyOverlayLeases.set(upperReal, lease);
++    recordDenyOverlayLease(token, upperReal);
++    overlayArgs.push(
++        '--bind', lease.root, lease.root,
++        '--overlay-src', lease.lower,
++        '--overlay', lease.upper, lease.work, lease.upper,
++        '--ro-bind', lease.root, lease.root,
++    );
++    logForDebugging(`[Sandbox Linux] Staged deny overlay: ${upperReal} (${entries.size} path(s))`);
++    return lease;
++}
++/**
++ * Release the deny-overlay leases held by one launch's cleanup token.
++ *
++ * Leases are refcounted: the shared root/lower/work tree is deleted only when
++ * the last holder releases it, so a completed command never detaches an
++ * overlay another concurrent sandbox still has mounted. Unknown tokens are
++ * ignored so failure paths can release unconditionally.
++ */
++export function releaseDenyOverlayLeases(token) {
++    if (!token) {
++        return;
++    }
++    const uppers = denyOverlayTokens.get(token);
++    if (!uppers) {
++        return;
++    }
++    denyOverlayTokens.delete(token);
++    for (const upper of uppers) {
++        const lease = denyOverlayLeases.get(upper);
++        if (!lease) {
++            continue;
++        }
++        lease.refs--;
++        if (lease.refs > 0) {
++            logForDebugging(`[Sandbox Linux] Released deny overlay lease (${lease.refs} remaining): ${upper}`);
++            continue;
++        }
++        denyOverlayLeases.delete(upper);
++        try {
++            fs.rmSync(lease.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
++            logForDebugging(`[Sandbox Linux] Cleaned up deny overlay: ${lease.root}`);
++        }
++        catch (error) {
++            logForDebugging(`[Sandbox Linux] Could not clean deny overlay ${lease.root}: ${error instanceof Error ? error.message : String(error)}`, { level: 'warn' });
+         }
+     }
+-    bwrapMountPoints.clear();
  }
  function isExecutable(p) {
      try {
-@@ -645,6 +727,10 @@
+@@ -551,7 +690,7 @@ function buildSandboxCommand(httpSocketPath, socksSocketPath, userCommand, apply
+     const socatCommands = [
+         `${socat} TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
+         `${socat} TCP-LISTEN:1080,fork,reuseaddr UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
+-        'trap "kill %1 %2 2>/dev/null; exit" EXIT',
++        'trap "kill %1 %2 2>/dev/null; wait %1 %2 2>/dev/null; exit" EXIT',
+     ];
+     // apply-seccomp runs after socat so socat can still create Unix sockets.
+     if (applySeccompPrefix) {
+@@ -630,7 +769,7 @@ function pushReadDenyDirMounts(args, normalizedPath, allowedWritePaths, readAllo
+ /**
+  * Generate filesystem bind mount arguments for bwrap
+  */
+-async function generateFilesystemArgs(readConfig, writeConfig, maskedFileBinds, maskedFileStoreDir, ripgrepConfig = { command: 'rg' }, mandatoryDenySearchDepth = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH, abortSignal) {
++async function generateFilesystemArgs(readConfig, writeConfig, maskedFileBinds, maskedFileStoreDir, ripgrepConfig = { command: 'rg' }, mandatoryDenySearchDepth = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH, abortSignal, cleanupToken) {
+     const args = [];
+     // fs already imported
+     // Collect normalized allowed write paths. Populated in the writeConfig
+@@ -645,6 +784,18 @@ async function generateFilesystemArgs(readConfig, writeConfig, maskedFileBinds,
      // symlink no longer matches them by string prefix. Both spellings name the
      // same inode once bwrap resolves them, so the comparisons below test both.
      const denyWriteRawDests = new Map();
 +    // Overlay mounts are emitted after read-policy mounts and before denyWrite
 +    // binds so tmpfs carve-outs cannot wipe them and every deny has a dentry.
 +    const denyOverlayArgs = [];
-+    const denyOverlays = new Map();
++    // Staged deny layout for this launch, keyed by canonical upper:
++    // Map(relative deny path -> must be staged as a directory). Complete before
++    // any lease is acquired, so the layout signature can be compared in full.
++    const denyOverlayPlan = new Map();
++    // Deny binds for staged paths, in deny-list order, recording where each
++    // bind's source slot lives in denyWriteArgs. The source (the lowerdir path,
++    // or /dev/null for file placeholders) is only known once the lease — and
++    // with it the lowerdir root — exists, so it is filled in after planning.
++    const stagedDenyBinds = [];
      // Determine initial root mount based on write restrictions
      if (writeConfig) {
          // Write restrictions: Start with read-only root, then allow writes to specific paths
-@@ -690,6 +776,7 @@
+@@ -690,6 +841,7 @@ async function generateFilesystemArgs(readConfig, writeConfig, maskedFileBinds,
              ...(writeConfig.denyWithinAllow || []),
              ...(await linuxGetMandatoryDenyPaths(ripgrepConfig, mandatoryDenySearchDepth, abortSignal)),
          ];
@@ -489,7 +653,7 @@ diff --git a/dist/sandbox/linux-sandbox-utils.js b/dist/sandbox/linux-sandbox-ut
          // Duplicate deny entries must be collapsed: a duplicate
          // --ro-bind /dev/null <dest> hits a char device on the second pass and
          // bwrap's ensure_file() falls through to creat() on a read-only mount.
-@@ -753,53 +840,27 @@
+@@ -753,53 +905,32 @@ async function generateFilesystemArgs(readConfig, writeConfig, maskedFileBinds,
                  logForDebugging(`[Sandbox Linux] Mounted /dev/null at symlink ${symlinkInPath} to prevent symlink replacement attack`);
                  continue;
              }
@@ -546,45 +710,767 @@ diff --git a/dist/sandbox/linux-sandbox-utils.js b/dist/sandbox/linux-sandbox-ut
 -                    }
 +                    const isDirectory = firstNonExistent !== normalizedPath ||
 +                        dangerousDirectoryNames.has(normalizeCaseForComparison(path.basename(firstNonExistent)));
-+                    const staged = stageMissingDenyPath(firstNonExistent, isDirectory, allowedWritePaths, denyOverlays, denyOverlayArgs);
-+                    denyWriteArgs.push('--ro-bind', staged.source, staged.dest);
-+                    denyWriteRawDests.set(staged.dest, rawPath);
++                    const planned = planMissingDenyPath(firstNonExistent, isDirectory, allowedWritePaths, denyOverlayPlan);
++                    denyWriteArgs.push('--ro-bind', '', firstNonExistent);
++                    stagedDenyBinds.push({
++                        upper: planned.upper,
++                        relative: planned.relative,
++                        argIndex: denyWriteArgs.length - 2,
++                    });
++                    denyWriteRawDests.set(firstNonExistent, rawPath);
 +                    logForDebugging(`[Sandbox Linux] Staged missing deny path in overlay: ${firstNonExistent}`);
                  }
                  else {
                      logForDebugging(`[Sandbox Linux] Skipping non-existent deny path not within allowed paths: ${normalizedPath}`);
-@@ -905,6 +966,16 @@
+@@ -905,6 +1036,29 @@ async function generateFilesystemArgs(readConfig, writeConfig, maskedFileBinds,
      // writable from inside the sandbox. Adding the dest to maskedFiles
      // ensures a later denyWrite ro-bind over the same path doesn't undo
      // the mask.
-+    for (const overlay of denyOverlays.values()) {
-+        const readDirConflict = tmpfsDirs.find(readPath => isPathAtOrBelow(readPath, overlay.upper));
-+        const readFileConflict = [...maskedFiles.keys()].find(readPath => isPathAtOrBelow(readPath, overlay.upper));
++    for (const upper of denyOverlayPlan.keys()) {
++        const readDirConflict = tmpfsDirs.find(readPath => isPathAtOrBelow(readPath, upper));
++        const readFileConflict = [...maskedFiles.keys()].find(readPath => isPathAtOrBelow(readPath, upper));
 +        if (readDirConflict || readFileConflict) {
-+            throw new Error(`Cannot safely combine a writable deny overlay at ${overlay.upper} with nested read deny ${readDirConflict ?? readFileConflict}`);
++            throw new Error(`Cannot safely combine a writable deny overlay at ${upper} with nested read deny ${readDirConflict ?? readFileConflict}`);
 +        }
 +    }
 +    // Overlay writable roots only after every read-policy tmpfs/rebind. File
 +    // credential masks and denyWrite binds then stack on the overlay.
++    // Leases are acquired here — after the whole layout is known — so reuse
++    // decisions compare complete signatures; the deny binds' sources are the
++    // staged lowerdir paths, resolved once each lease holds a root.
++    const leases = new Map();
++    for (const [upper, entries] of denyOverlayPlan) {
++        leases.set(upper, acquireDenyOverlayLease(cleanupToken, upper, entries, allowedWritePaths, denyOverlayArgs));
++    }
++    for (const { upper, relative, argIndex } of stagedDenyBinds) {
++        const lease = leases.get(upper);
++        denyWriteArgs[argIndex] = denyOverlayPlan.get(upper).get(relative)
++            ? path.join(lease.lower, relative)
++            : '/dev/null';
++    }
 +    args.push(...denyOverlayArgs);
      for (const { realPath, fakePath } of maskedFileBinds ?? []) {
          const dest = resolveSymlinkDenyDest(realPath);
          args.push('--ro-bind', fakePath, dest);
-diff --git a/dist/index.js b/dist/index.js
---- a/dist/index.js
-+++ b/dist/index.js
-@@ -9 +9 @@
--export { getDefaultWritePaths } from './sandbox/sandbox-utils.js';
-+export { DANGEROUS_FILES, getDangerousDirectories, getDefaultWritePaths } from './sandbox/sandbox-utils.js';
-diff --git a/dist/index.d.ts b/dist/index.d.ts
---- a/dist/index.d.ts
-+++ b/dist/index.d.ts
-@@ -13 +13 @@
--export { getDefaultWritePaths } from './sandbox/sandbox-utils.js';
-+export { DANGEROUS_FILES, getDangerousDirectories, getDefaultWritePaths } from './sandbox/sandbox-utils.js';
+@@ -1042,7 +1196,7 @@ async function generateFilesystemArgs(readConfig, writeConfig, maskedFileBinds,
+  * Dependencies are checked by checkLinuxDependencies() before enabling the sandbox.
+  */
+ export async function wrapCommandWithSandboxLinux(params) {
+-    const { command, needsNetworkRestriction, httpSocketPath, socksSocketPath, httpProxyPort, socksProxyPort, proxyAuthToken, caCertPath, readConfig, writeConfig, unsetEnvVars, setEnvVars, maskedFileBinds, maskedFileStoreDir, enableWeakerNestedSandbox, allowAllUnixSockets, binShell, ripgrepConfig = { command: 'rg' }, mandatoryDenySearchDepth = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH, seccompConfig, bwrapPath, socatPath, observeSocketPath, abortSignal, } = params;
++    const { command, needsNetworkRestriction, httpSocketPath, socksSocketPath, httpProxyPort, socksProxyPort, proxyAuthToken, caCertPath, readConfig, writeConfig, unsetEnvVars, setEnvVars, maskedFileBinds, maskedFileStoreDir, enableWeakerNestedSandbox, allowAllUnixSockets, binShell, ripgrepConfig = { command: 'rg' }, mandatoryDenySearchDepth = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH, seccompConfig, bwrapPath, socatPath, observeSocketPath, abortSignal, cleanupToken, networkContext, } = params;
+     // Determine if we have restrictions to apply
+     // Read: denyOnly pattern - empty array means no restrictions
+     // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
+@@ -1058,13 +1212,10 @@ export async function wrapCommandWithSandboxLinux(params) {
+         !hasEnvRestrictions) {
+         return command;
+     }
+-    // Mark this sandbox invocation as active. cleanupBwrapMountPoints() will
+-    // defer file deletion until this (and every other concurrent) invocation
+-    // has been cleaned up. The matching decrement happens in
+-    // cleanupBwrapMountPoints(), which the caller must invoke after the
+-    // spawned command exits. If wrapping fails below, the catch block
+-    // decrements so the count does not leak.
+-    activeSandboxCount++;
++    // Deny-overlay leases acquired below are owned by `cleanupToken`. The
++    // caller releases them through cleanupAfterCommand(token) once the spawned
++    // command exits; if wrapping fails, the catch block releases them so no
++    // lease is stranded.
+     const bwrapArgs = ['--new-session', '--die-with-parent'];
+     let applySeccompPrefix;
+     try {
+@@ -1146,7 +1297,7 @@ export async function wrapCommandWithSandboxLinux(params) {
+                 // which forwards to the Unix socket that bridges to the host's proxy server
+                 const proxyEnv = generateProxyEnvVars(3128, // Internal HTTP listener port
+                 1080, // Internal SOCKS listener port
+-                caCertPath, proxyAuthToken, writeConfig === undefined);
++                caCertPath, proxyAuthToken, writeConfig === undefined, networkContext);
+                 bwrapArgs.push(...proxyEnv.flatMap((env) => {
+                     const firstEq = env.indexOf('=');
+                     const key = env.slice(0, firstEq);
+@@ -1165,7 +1316,7 @@ export async function wrapCommandWithSandboxLinux(params) {
+             // If no sockets provided, network is completely blocked (--unshare-net without proxy)
+         }
+         // ========== FILESYSTEM RESTRICTIONS ==========
+-        const fsArgs = await generateFilesystemArgs(readConfig, writeConfig, maskedFileBinds, maskedFileStoreDir, ripgrepConfig, mandatoryDenySearchDepth, abortSignal);
++        const fsArgs = await generateFilesystemArgs(readConfig, writeConfig, maskedFileBinds, maskedFileStoreDir, ripgrepConfig, mandatoryDenySearchDepth, abortSignal, cleanupToken);
+         bwrapArgs.push(...fsArgs);
+         // Always bind /dev
+         bwrapArgs.push('--dev', '/dev');
+@@ -1208,7 +1359,7 @@ export async function wrapCommandWithSandboxLinux(params) {
+         // Use the user's shell (zsh, bash, etc.) to ensure aliases/snapshots work
+         // Resolve the full path to the shell binary since bwrap doesn't use $PATH
+         const shellName = binShell || 'bash';
+-        const shell = whichSync(shellName);
++        const shell = shellName.includes('/') && isExecutable(shellName) ? shellName : whichSync(shellName);
+         if (!shell) {
+             throw new Error(`Shell '${shellName}' not found in PATH`);
+         }
+@@ -1241,11 +1392,9 @@ export async function wrapCommandWithSandboxLinux(params) {
+         return wrappedCommand;
+     }
+     catch (error) {
+-        // Undo the activeSandboxCount increment — the caller won't call
+-        // cleanupBwrapMountPoints() for a wrap that threw.
+-        if (activeSandboxCount > 0) {
+-            activeSandboxCount--;
+-        }
++        // Release the leases this wrap acquired — the caller won't call
++        // cleanupAfterCommand() for a wrap that threw.
++        releaseDenyOverlayLeases(cleanupToken);
+         throw error;
+     }
+ }
+diff --git a/dist/sandbox/macos-sandbox-utils.d.ts b/dist/sandbox/macos-sandbox-utils.d.ts
+index 1ceab57..1558a0f 100644
+--- a/dist/sandbox/macos-sandbox-utils.d.ts
++++ b/dist/sandbox/macos-sandbox-utils.d.ts
+@@ -7,6 +7,8 @@ export interface MacOSSandboxParams {
+     socksProxyPort?: number;
+     /** Per-session proxy auth token; embedded in proxy env URLs. */
+     proxyAuthToken?: string;
++    /** Per-launch context carried in authenticated proxy credentials. */
++    networkContext?: string;
+     /** Path to the TLS-termination CA cert; injected as trust env vars. */
+     caCertPath?: string;
+     allowUnixSockets?: string[];
+diff --git a/dist/sandbox/macos-sandbox-utils.js b/dist/sandbox/macos-sandbox-utils.js
+index 15a93d4..e7bef97 100644
+--- a/dist/sandbox/macos-sandbox-utils.js
++++ b/dist/sandbox/macos-sandbox-utils.js
+@@ -585,7 +585,7 @@ function escapePath(pathStr) {
+  * Wrap command with macOS sandbox
+  */
+ export function wrapCommandWithSandboxMacOS(params) {
+-    const { command, needsNetworkRestriction, httpProxyPort, socksProxyPort, proxyAuthToken, caCertPath, allowUnixSockets, allowAllUnixSockets, allowLocalBinding, allowMachLookup, readConfig: readConfigIn, writeConfig, unsetEnvVars, setEnvVars, maskedFileBinds, allowPty, allowBrowserProcess = false, enableWeakerNetworkIsolation = false, allowAppleEvents = false, binShell, } = params;
++    const { command, needsNetworkRestriction, httpProxyPort, socksProxyPort, proxyAuthToken, networkContext, caCertPath, allowUnixSockets, allowAllUnixSockets, allowLocalBinding, allowMachLookup, readConfig: readConfigIn, writeConfig, unsetEnvVars, setEnvVars, maskedFileBinds, allowPty, allowBrowserProcess = false, enableWeakerNetworkIsolation = false, allowAppleEvents = false, binShell, } = params;
+     // SBPL cannot redirect a read to different bytes, so whole-file masking
+     // degrades to read-deny on macOS: the sandboxed process gets EPERM
+     // instead of the sentinel. The DYLD interposer (a later step) lifts
+@@ -635,7 +635,7 @@ export function wrapCommandWithSandboxMacOS(params) {
+         logTag,
+     });
+     // Generate proxy environment variables using shared utility
+-    const proxyEnvArgs = generateProxyEnvVars(httpProxyPort, socksProxyPort, caCertPath, proxyAuthToken, writeConfig === undefined);
++    const proxyEnvArgs = generateProxyEnvVars(httpProxyPort, socksProxyPort, caCertPath, proxyAuthToken, writeConfig === undefined, networkContext);
+     // Seatbelt's (remote ip "localhost:*") filter — used for the
+     // allowLocalBinding outbound rule above — matches 127.0.0.1 and ::1 but not
+     // the IPv4-mapped IPv6 form ::ffff:127.0.0.1. Modern Java defaults to
+diff --git a/dist/sandbox/sandbox-manager.d.ts b/dist/sandbox/sandbox-manager.d.ts
+index 39eb9e2..369eea5 100644
+--- a/dist/sandbox/sandbox-manager.d.ts
++++ b/dist/sandbox/sandbox-manager.d.ts
+@@ -29,6 +29,17 @@ export interface ISandboxManager {
+     getLinuxSocksSocketPath(): string | undefined;
+     waitForNetworkInitialization(): Promise<boolean>;
+     wrapWithSandbox(command: string, binShell?: string, customConfig?: Partial<SandboxRuntimeConfig>, abortSignal?: AbortSignal): Promise<string>;
++    /**
++     * Wrap `command` and return its lease `{ command, cleanupToken }`. The token
++     * owns this launch's deny-overlay leases and must be passed to
++     * cleanupAfterCommand() once the spawned command exits. `networkContext`
++     * rides in the proxy credentials so proxy callbacks can attribute proxied
++     * SSH tunnels to this launch.
++     */
++    wrapWithSandboxLease(command: string, binShell?: string, customConfig?: Partial<SandboxRuntimeConfig>, abortSignal?: AbortSignal, networkContext?: string): Promise<{
++        command: string;
++        cleanupToken?: string;
++    }>;
+     wrapWithSandboxArgv(command: string, binShell?: string | WindowsBinShell, customConfig?: Partial<SandboxRuntimeConfig>, abortSignal?: AbortSignal, cwd?: string): Promise<{
+         argv: string[];
+         env: NodeJS.ProcessEnv;
+@@ -41,7 +52,7 @@ export interface ISandboxManager {
+     getSentinelRegistry(): SentinelRegistry;
+     getMaskedFileStore(): MaskedFileStore;
+     updateConfig(newConfig: SandboxRuntimeConfig): void;
+-    cleanupAfterCommand(): void;
++    cleanupAfterCommand(cleanupToken?: string): void;
+     reset(): Promise<void>;
+ }
+ /** Create an independent macOS/Linux sandbox session with its own policy and proxies. */
+diff --git a/dist/sandbox/sandbox-manager.js b/dist/sandbox/sandbox-manager.js
+index e4fdc8d..46ce84c 100644
+--- a/dist/sandbox/sandbox-manager.js
++++ b/dist/sandbox/sandbox-manager.js
+@@ -11,7 +11,7 @@ import { whichSync } from '../utils/which.js';
+ import { getPlatform, getWslVersion } from '../utils/platform.js';
+ import * as fs from 'fs';
+ import { randomBytes, X509Certificate } from 'node:crypto';
+-import { wrapCommandWithSandboxLinux, initializeLinuxNetworkBridge, checkLinuxDependencies, cleanupBwrapMountPoints, } from './linux-sandbox-utils.js';
++import { wrapCommandWithSandboxLinux, initializeLinuxNetworkBridge, checkLinuxDependencies, createDenyOverlayCleanupToken, releaseDenyOverlayLeases, } from './linux-sandbox-utils.js';
+ import { wrapCommandWithSandboxMacOS, startMacOSSandboxLogMonitor, } from './macos-sandbox-utils.js';
+ import { startLinuxSandboxViolationMonitor, } from './linux-violation-monitor.js';
+ import { checkWindowsDependencies, wrapCommandWithSandboxWindows, parseWindowsBinShell, expandWindowsFsPaths, stampWindowsAcl, restoreWindowsAcl, grantWindowsAcl, revokeWindowsAcl, getWindowsSandboxUserStatus, getWindowsSandboxCaCert, verifyWindowsWfpEgress, resolveSrtWin, DEFAULT_WINDOWS_PROXY_PORT_RANGE, } from './windows-sandbox-utils.js';
+@@ -71,6 +71,10 @@ function createManager(legacySingleton) {
+     // the sandbox child env, checked on every CONNECT/request — so a host process
+     // dialing 127.0.0.1:<proxyPort> can't reach the filter callback.
+     let proxyAuthToken;
++    // Cleanup tokens from legacy wrapWithSandbox() callers. They predate
++    // per-launch tokens and pair each wrap with exactly one
++    // cleanupAfterCommand() call, so their tokens are released oldest-first.
++    const legacyCleanupTokens = [];
+     // Windows: the resolved access set that was actually applied at
+     // initialize(). `undefined` means no stamp/grant was applied
+     // (gates running `acl restore`/`acl revoke` at reset()).
+@@ -240,6 +244,9 @@ function createManager(legacySingleton) {
+         const injectCredentials = buildCredentialInjector();
+         httpProxyServer = createHttpProxyServer({
+             filter: (port, host) => filterNetworkRequest(port, host, sandboxAskCallback),
++            filterSsh: sandboxAskCallback
++                ? (port, host, context) => sandboxAskCallback({ host, port, protocol: 'ssh', context })
++                : undefined,
+             getMitmSocketPath,
+             mitmCA,
+             shouldTerminateTLS: shouldTerminateTLSForHost,
+@@ -256,6 +263,9 @@ function createManager(legacySingleton) {
+         });
+         socksProxyServer = createSocksProxyServer({
+             filter: (port, host) => filterNetworkRequest(port, host, sandboxAskCallback),
++            filterSsh: sandboxAskCallback
++                ? (port, host, context) => sandboxAskCallback({ host, port, protocol: 'ssh', context })
++                : undefined,
+             parentProxy,
+             proxyAuthToken: config?.network.allowUnauthenticatedSocksProxy
+                 ? undefined
+@@ -932,8 +942,32 @@ function createManager(legacySingleton) {
+         }
+         return managerContext !== undefined;
+     }
++    /**
++     * Wrap `command` and return its lease: `{ command, cleanupToken }`.
++     *
++     * The token owns the launch's deny-overlay leases (Linux) and must be
++     * handed to cleanupAfterCommand(token) once the spawned command exits, so
++     * the shared overlay root is deleted exactly when its last holder is done.
++     * `networkContext` rides in the proxy credentials, letting proxy callbacks
++     * attribute a connection (notably an SSH tunnel) to this launch.
++     */
++    async function wrapWithSandboxLease(command, binShell, customConfig, abortSignal, networkContext) {
++        return wrapSandboxedCommand(command, binShell, customConfig, abortSignal, networkContext, false);
++    }
++    /**
++     * Legacy wrapper returning only the shell command. Its cleanup token is
++     * queued internally so a later `cleanupAfterCommand()` (no token) releases
++     * the oldest outstanding wrap — the pairing callers had before tokens.
++     */
+     async function wrapWithSandbox(command, binShell, customConfig, abortSignal) {
++        const lease = await wrapSandboxedCommand(command, binShell, customConfig, abortSignal, undefined, true);
++        return lease.command;
++    }
++    async function wrapSandboxedCommand(command, binShell, customConfig, abortSignal, networkContext, legacyCleanupToken) {
+         const platform = getPlatform();
++        // Each Linux launch owns its deny-overlay leases through an opaque
++        // cleanup token; a failed wrap releases them in the catch below.
++        const cleanupToken = platform === 'linux' ? createDenyOverlayCleanupToken() : undefined;
+         // filesystem.disabled bypasses ALL filesystem rule generation. Both
+         // platform wrappers treat readConfig/writeConfig === undefined as "no
+         // filesystem restrictions" (seatbelt emits `(allow file-write*)`; bwrap
+@@ -1040,81 +1074,99 @@ function createManager(legacySingleton) {
+         const allowPty = customConfig?.allowPty ?? config?.allowPty;
+         // Check custom config to allow browser process operations (Chrome/Chromium)
+         const allowBrowserProcess = customConfig?.allowBrowserProcess ?? config?.allowBrowserProcess;
+-        switch (platform) {
+-            case 'macos':
+-                // macOS sandbox profile supports glob patterns directly, no ripgrep needed
+-                return wrapCommandWithSandboxMacOS({
+-                    command,
+-                    needsNetworkRestriction,
+-                    // Only pass proxy ports if proxy is running (when there are domains to filter)
+-                    httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
+-                    socksProxyPort: needsNetworkProxy ? getSocksProxyPort() : undefined,
+-                    proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
+-                    caCertPath: mitmCA?.trustBundlePath,
+-                    readConfig,
+-                    writeConfig,
+-                    unsetEnvVars: credentialRestrictions.unsetEnvVars,
+-                    setEnvVars: credentialRestrictions.setEnvVars,
+-                    maskedFileBinds: credentialRestrictions.maskedFileBinds,
+-                    allowUnixSockets: getAllowUnixSockets(),
+-                    allowAllUnixSockets: getAllowAllUnixSockets(),
+-                    allowLocalBinding: getAllowLocalBinding(),
+-                    allowMachLookup: getAllowMachLookup(),
+-                    ignoreViolations: getIgnoreViolations(),
+-                    allowPty,
+-                    allowBrowserProcess,
+-                    enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
+-                    allowAppleEvents: getAllowAppleEvents(),
+-                    binShell,
+-                });
+-            case 'linux':
+-                return wrapCommandWithSandboxLinux({
+-                    command,
+-                    needsNetworkRestriction,
+-                    // Only pass socket paths if proxy is running (when there are domains to filter)
+-                    httpSocketPath: needsNetworkProxy
+-                        ? getLinuxHttpSocketPath()
+-                        : undefined,
+-                    socksSocketPath: needsNetworkProxy
+-                        ? getLinuxSocksSocketPath()
+-                        : undefined,
+-                    httpProxyPort: needsNetworkProxy
+-                        ? managerContext?.httpProxyPort
+-                        : undefined,
+-                    socksProxyPort: needsNetworkProxy
+-                        ? managerContext?.socksProxyPort
+-                        : undefined,
+-                    proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
+-                    caCertPath: mitmCA?.trustBundlePath,
+-                    readConfig,
+-                    writeConfig,
+-                    unsetEnvVars: credentialRestrictions.unsetEnvVars,
+-                    setEnvVars: credentialRestrictions.setEnvVars,
+-                    maskedFileBinds: credentialRestrictions.maskedFileBinds,
+-                    maskedFileStoreDir: credentialRestrictions.maskedFileStoreDir,
+-                    enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
+-                    allowAllUnixSockets: getAllowAllUnixSockets(),
+-                    binShell,
+-                    ripgrepConfig: getRipgrepConfig(),
+-                    mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
+-                    seccompConfig: getSeccompConfig(),
+-                    bwrapPath: config?.bwrapPath,
+-                    socatPath: config?.socatPath,
+-                    observeSocketPath: linuxMonitor?.observeSocketPath,
+-                    abortSignal,
+-                });
+-            case 'windows':
+-                // Windows wraps to an argv array, not a shell string. Forcing
+-                // callers through wrapWithSandboxArgv() means they spawn with
+-                // {shell:false}, which is the security boundary that keeps the
+-                // user's command bytes off the HOST shell.
+-                throw new Error('wrapWithSandbox() returns a shell string and is not supported ' +
+-                    'on Windows. Use SandboxManager.wrapWithSandboxArgv() and ' +
+-                    'spawn the result with {shell: false}.');
+-            default:
+-                // Unsupported platform - this should not happen since isSandboxingEnabled() checks platform support
+-                throw new Error(`Sandbox configuration is not supported on platform: ${platform}`);
++        let wrapped;
++        try {
++            switch (platform) {
++                case 'macos':
++                    // macOS sandbox profile supports glob patterns directly, no ripgrep needed
++                    wrapped = await wrapCommandWithSandboxMacOS({
++                        command,
++                        needsNetworkRestriction,
++                        // Only pass proxy ports if proxy is running (when there are domains to filter)
++                        httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
++                        socksProxyPort: needsNetworkProxy ? getSocksProxyPort() : undefined,
++                        proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
++                        caCertPath: mitmCA?.trustBundlePath,
++                        networkContext,
++                        readConfig,
++                        writeConfig,
++                        unsetEnvVars: credentialRestrictions.unsetEnvVars,
++                        setEnvVars: credentialRestrictions.setEnvVars,
++                        maskedFileBinds: credentialRestrictions.maskedFileBinds,
++                        allowUnixSockets: getAllowUnixSockets(),
++                        allowAllUnixSockets: getAllowAllUnixSockets(),
++                        allowLocalBinding: getAllowLocalBinding(),
++                        allowMachLookup: getAllowMachLookup(),
++                        ignoreViolations: getIgnoreViolations(),
++                        allowPty,
++                        allowBrowserProcess,
++                        enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
++                        allowAppleEvents: getAllowAppleEvents(),
++                        binShell,
++                    });
++                    break;
++                case 'linux':
++                    wrapped = await wrapCommandWithSandboxLinux({
++                        command,
++                        needsNetworkRestriction,
++                        // Only pass socket paths if proxy is running (when there are domains to filter)
++                        httpSocketPath: needsNetworkProxy
++                            ? getLinuxHttpSocketPath()
++                            : undefined,
++                        socksSocketPath: needsNetworkProxy
++                            ? getLinuxSocksSocketPath()
++                            : undefined,
++                        httpProxyPort: needsNetworkProxy
++                            ? managerContext?.httpProxyPort
++                            : undefined,
++                        socksProxyPort: needsNetworkProxy
++                            ? managerContext?.socksProxyPort
++                            : undefined,
++                        proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
++                        caCertPath: mitmCA?.trustBundlePath,
++                        readConfig,
++                        writeConfig,
++                        unsetEnvVars: credentialRestrictions.unsetEnvVars,
++                        setEnvVars: credentialRestrictions.setEnvVars,
++                        maskedFileBinds: credentialRestrictions.maskedFileBinds,
++                        maskedFileStoreDir: credentialRestrictions.maskedFileStoreDir,
++                        enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
++                        allowAllUnixSockets: getAllowAllUnixSockets(),
++                        binShell,
++                        ripgrepConfig: getRipgrepConfig(),
++                        mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
++                        seccompConfig: getSeccompConfig(),
++                        bwrapPath: config?.bwrapPath,
++                        socatPath: config?.socatPath,
++                        observeSocketPath: linuxMonitor?.observeSocketPath,
++                        abortSignal,
++                        cleanupToken,
++                        networkContext,
++                    });
++                    break;
++                case 'windows':
++                    // Windows wraps to an argv array, not a shell string. Forcing
++                    // callers through wrapWithSandboxArgv() means they spawn with
++                    // {shell:false}, which is the security boundary that keeps the
++                    // user's command bytes off the HOST shell.
++                    throw new Error('wrapWithSandbox() returns a shell string and is not supported ' +
++                        'on Windows. Use SandboxManager.wrapWithSandboxArgv() and ' +
++                        'spawn the result with {shell: false}.');
++                default:
++                    // Unsupported platform - this should not happen since isSandboxingEnabled() checks platform support
++                    throw new Error(`Sandbox configuration is not supported on platform: ${platform}`);
++            }
++        }
++        catch (error) {
++            // A failed wrap must not strand the leases it acquired; releasing an
++            // unknown token is a no-op, so this is safe on every platform.
++            releaseDenyOverlayLeases(cleanupToken);
++            throw error;
++        }
++        if (legacyCleanupToken && cleanupToken !== undefined) {
++            legacyCleanupTokens.push(cleanupToken);
+         }
++        return { command: wrapped, cleanupToken };
+     }
+     /**
+      * Wrap `command` for the sandbox and return a spawn descriptor:
+@@ -1287,17 +1339,27 @@ function createManager(legacySingleton) {
+         logForDebugging('Sandbox configuration updated');
+     }
+     /**
+-     * Lightweight cleanup to call after each sandboxed command completes.
++     * Release the deny-overlay leases created for one sandboxed command.
+      *
+-     * On Linux, bwrap creates empty files on the host filesystem as mount points
+-     * when protecting non-existent deny paths (e.g. ~/.bashrc, ~/.gitconfig).
+-     * These persist after bwrap exits. This function removes them.
++     * Pass the `cleanupToken` returned by wrapWithSandboxLease() to release
++     * exactly that launch's leases: a shared overlay root is deleted only once
++     * its last holder releases it, so completing commands never detach an
++     * overlay another sandbox is still mounted on.
+      *
+-     * Safe to call on any platform — it's a no-op on macOS.
+-     * Also called automatically by reset() and on process exit as safety nets.
++     * Called without a token (legacy callers), it releases the oldest
++     * outstanding wrapWithSandbox() cleanup, keeping the one-wrap/one-cleanup
++     * pairing those callers rely on. Safe to call on any platform — it is a
++     * no-op wherever no leases exist (e.g. macOS).
+      */
+-    function cleanupAfterCommand() {
+-        cleanupBwrapMountPoints();
++    function cleanupAfterCommand(cleanupToken) {
++        if (cleanupToken !== undefined) {
++            releaseDenyOverlayLeases(cleanupToken);
++            return;
++        }
++        const legacyToken = legacyCleanupTokens.shift();
++        if (legacyToken !== undefined) {
++            releaseDenyOverlayLeases(legacyToken);
++        }
+     }
+     /**
+      * How long to wait for a bridge process to exit after SIGTERM before
+@@ -1459,8 +1521,9 @@ function createManager(legacySingleton) {
+         windowsFsRawInputs = undefined;
+         srtWinSpawn = undefined;
+         // windowsWfpVerified is NOT cleared — per-process, not per-session.
+-        // Other managers may still have commands using these process-wide mounts.
+-        cleanupBwrapMountPoints({ completed: false });
++        // Deny-overlay leases are owned by their launch's cleanup token, not by
++        // this manager, and reset() must not touch them: other commands (this
++        // manager's or another's) may still have the same overlays mounted.
+         // Stop log monitor
+         if (logMonitorShutdown) {
+             logMonitorShutdown();
+@@ -1607,6 +1670,7 @@ function createManager(legacySingleton) {
+         getLinuxSocksSocketPath,
+         waitForNetworkInitialization,
+         wrapWithSandbox,
++        wrapWithSandboxLease,
+         wrapWithSandboxArgv,
+         cleanupAfterCommand,
+         reset,
+diff --git a/dist/sandbox/sandbox-schemas.d.ts b/dist/sandbox/sandbox-schemas.d.ts
+index 451fcd5..e9bd97f 100644
+--- a/dist/sandbox/sandbox-schemas.d.ts
++++ b/dist/sandbox/sandbox-schemas.d.ts
+@@ -85,6 +85,19 @@ export interface NetworkRestrictionConfig {
+ export type NetworkHostPattern = {
+     host: string;
+     port: number | undefined;
++    /**
++     * Set when the request is an SSH identification exchange sniffed on an
++     * otherwise opaque proxy tunnel. SSH gating goes through this callback
++     * rather than the plain domain filter.
++     */
++    protocol?: 'ssh';
++    /**
++     * Network context carried by the proxied connection's credentials (the
++     * per-launch context passed to wrapWithSandboxLease). Lets the callback
++     * attribute a connection to the launch that spawned it; absent when the
++     * credentials carried none.
++     */
++    context?: string;
+ };
+ export type SandboxAskCallback = (params: NetworkHostPattern) => Promise<boolean>;
+ //# sourceMappingURL=sandbox-schemas.d.ts.map
+\ No newline at end of file
 diff --git a/dist/sandbox/sandbox-utils.d.ts b/dist/sandbox/sandbox-utils.d.ts
+index 39ae2df..4d42e20 100644
 --- a/dist/sandbox/sandbox-utils.d.ts
 +++ b/dist/sandbox/sandbox-utils.d.ts
-@@ -10 +10 @@
+@@ -7,7 +7,7 @@ export declare const DANGEROUS_FILES: readonly [".gitconfig", ".bashrc", ".bash_
+  * Dangerous directories that should be protected from writes.
+  * These directories contain sensitive configuration or executable files.
+  */
 -export declare const DANGEROUS_DIRECTORIES: readonly [];
 +export declare const DANGEROUS_DIRECTORIES: readonly [".omp"];
+ /**
+  * Get the list of dangerous directories to deny writes to.
+  */
+@@ -104,15 +104,37 @@ export declare function normalizePathForSandbox(pathPattern: string): string;
+  * environments, you should configure more restrictive write paths.
+  */
+ export declare function getDefaultWritePaths(): string[];
+-/**
+- * Generate proxy environment variables for sandboxed processes
+- */
+ /**
+  * Per-tool trust-store env vars set to the TLS-termination CA cert path so
+  * HTTPS clients in the sandboxed child accept proxy-minted certs.
+  */
+ export declare const CA_TRUST_VARS: readonly ["NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "PIP_CERT", "GIT_SSL_CAINFO", "AWS_CA_BUNDLE", "CARGO_HTTP_CAINFO", "DENO_CERT", "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE", "NIX_SSL_CERT_FILE"];
+-export declare function generateProxyEnvVars(httpProxyPort?: number, socksProxyPort?: number, caCertPath?: string, proxyAuthToken?: string, skipTmpdir?: boolean): string[];
++/**
++ * Generate proxy environment variables for sandboxed processes.
++ *
++ * `networkContext`, when set, is carried as the proxy credentials' username
++ * (`srt.<base64url context>`) so proxy callbacks can attribute connections to
++ * the launch that spawned them. The password remains the auth token.
++ */
++export declare function generateProxyEnvVars(httpProxyPort?: number, socksProxyPort?: number, caCertPath?: string, proxyAuthToken?: string, skipTmpdir?: boolean, networkContext?: string): string[];
++/**
++ * Build the proxy-auth username carrying `networkContext`. Returns the bare
++ * `srt` when there is no context; the context is base64url-encoded so it
++ * survives URL userinfo and Basic auth verbatim. Throws when the encoded
++ * username cannot fit the SOCKS5/Basic username framing.
++ */
++export declare function proxyAuthUsername(networkContext?: string): string;
++/**
++ * Whether `username` is a proxy-auth username this runtime mints: `srt`, or
++ * `srt.<base64url context>`.
++ */
++export declare function isProxyAuthUsername(username?: string): boolean;
++/**
++ * Decode the network context carried by a proxy-auth username. Unknown or
++ * context-less usernames decode to undefined; authentication never depends on
++ * this value (the password is the secret).
++ */
++export declare function proxyAuthNetworkContext(username?: string): string | undefined;
+ /**
+  * Encode a command for sandbox monitoring
+  * Truncates to 100 chars and base64 encodes to avoid parsing issues
+diff --git a/dist/sandbox/sandbox-utils.js b/dist/sandbox/sandbox-utils.js
+index a724be4..5df6e32 100644
+--- a/dist/sandbox/sandbox-utils.js
++++ b/dist/sandbox/sandbox-utils.js
+@@ -21,7 +21,7 @@ export const DANGEROUS_FILES = [
+  * Dangerous directories that should be protected from writes.
+  * These directories contain sensitive configuration or executable files.
+  */
+-export const DANGEROUS_DIRECTORIES = [];
++export const DANGEROUS_DIRECTORIES = ['.omp'];
+ /**
+  * Get the list of dangerous directories to deny writes to.
+  */
+@@ -314,10 +314,10 @@ export function getDefaultWritePaths() {
+         '/dev/tty',
+         '/dev/dtracehelper',
+         '/dev/autofs_nowait',
+-        '/tmp/claude',
+-        '/private/tmp/claude',
++        '/tmp/omp',
++        '/private/tmp/omp',
+         path.join(homeDir, '.npm/_logs'),
+-        path.join(homeDir, '.claude/debug'),
++        path.join(homeDir, '.omp/debug'),
+     ];
+     return recommendedPaths;
+ }
+@@ -346,11 +346,47 @@ export const CA_TRUST_VARS = [
+     // must override it explicitly.
+     'NIX_SSL_CERT_FILE',
+ ];
+-export function generateProxyEnvVars(httpProxyPort, socksProxyPort, caCertPath, proxyAuthToken, skipTmpdir) {
+-    // When the proxy requires auth, embed the credential in the URL so clients
+-    // send Proxy-Authorization automatically. Only the sandbox child sees this
+-    // env, so the token never reaches host processes.
+-    const auth = proxyAuthToken ? `srt:${proxyAuthToken}@` : '';
++const PROXY_AUTH_USER_PREFIX = 'srt';
++// SOCKS5 frames the username in a single length byte, and Basic auth has no
++// room for framing either; keep the encoded username well inside both.
++const PROXY_AUTH_USER_MAX_BYTES = 255;
++/**
++ * Proxy-auth username carrying this launch's network context.
++ *
++ * The password stays the authentication secret (the session token); the
++ * username is only an attribution channel, so callbacks can tell which launch
++ * a proxied connection belongs to. The context is base64url-encoded because it
++ * round-trips through URL userinfo and Basic auth verbatim, regardless of the
++ * characters the caller used.
++ */
++export function proxyAuthUsername(networkContext) {
++    if (!networkContext)
++        return PROXY_AUTH_USER_PREFIX;
++    const username = `${PROXY_AUTH_USER_PREFIX}.${Buffer.from(networkContext, 'utf8').toString('base64url')}`;
++    if (Buffer.byteLength(username, 'utf8') > PROXY_AUTH_USER_MAX_BYTES) {
++        throw new Error(`Network context is too long to carry in proxy credentials (${Buffer.byteLength(networkContext, 'utf8')} bytes)`);
++    }
++    return username;
++}
++/**
++ * Whether `username` is a proxy-auth username this runtime mints: the bare
++ * legacy `srt`, or `srt.<base64url context>`.
++ */
++export function isProxyAuthUsername(username) {
++    return username === PROXY_AUTH_USER_PREFIX || /^srt\.[A-Za-z0-9_-]+$/.test(username ?? '');
++}
++/**
++ * Decode the network context carried by a proxy-auth username. Unknown or
++ * context-less usernames decode to `undefined`; authentication never depends
++ * on this value (the password is the secret).
++ */
++export function proxyAuthNetworkContext(username) {
++    if (username === undefined || username === PROXY_AUTH_USER_PREFIX || !isProxyAuthUsername(username)) {
++        return undefined;
++    }
++    return Buffer.from(username.slice(PROXY_AUTH_USER_PREFIX.length + 1), 'base64url').toString('utf8');
++}
++export function generateProxyEnvVars(httpProxyPort, socksProxyPort, caCertPath, proxyAuthToken, skipTmpdir, networkContext) {
+     const envVars = [`SANDBOX_RUNTIME=1`];
+     // TMPDIR is overridden so temp-file writers land in a path the FS sandbox
+     // allows (getDefaultWritePaths). When filesystem policy is disabled
+@@ -376,6 +412,11 @@ export function generateProxyEnvVars(httpProxyPort, socksProxyPort, caCertPath,
+     if (!httpProxyPort && !socksProxyPort) {
+         return envVars;
+     }
++    // When the proxy requires auth, embed the credential in the URL so clients
++    // send Proxy-Authorization automatically: the password is the session
++    // token, the username carries this launch's network context. Only the
++    // sandbox child sees this env, so the token never reaches host processes.
++    const auth = proxyAuthToken ? `${proxyAuthUsername(networkContext)}:${proxyAuthToken}@` : '';
+     // Always set NO_PROXY to exclude localhost and private networks from
+     // proxying. *.local is intentionally absent: under network restriction the
+     // child has no usable resolver/routes (bwrap --unshare-net on Linux,
+@@ -442,7 +483,7 @@ export function generateProxyEnvVars(httpProxyPort, socksProxyPort, caCertPath,
+             // Linux: use socat HTTP CONNECT via the HTTP proxy bridge.
+             // socat is already a required Linux sandbox dependency, and PROXY: is
+             // portable across all socat versions (unlike SOCKS5-CONNECT which needs >= 1.8.0).
+-            const socatAuth = proxyAuthToken ? `,proxyauth=srt:${proxyAuthToken}` : '';
++            const socatAuth = proxyAuthToken ? `,proxyauth=${proxyAuthUsername(networkContext)}:${proxyAuthToken}` : '';
+             envVars.push(`GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='socat - PROXY:localhost:%h:%p,proxyport=${httpProxyPort}${socatAuth}'`);
+         }
+         // FTP proxy support (use socks5h for DNS resolution through proxy)
+@@ -472,7 +513,7 @@ export function generateProxyEnvVars(httpProxyPort, socksProxyPort, caCertPath,
+             envVars.push(`CLOUDSDK_PROXY_ADDRESS=localhost`);
+             envVars.push(`CLOUDSDK_PROXY_PORT=${httpProxyPort}`);
+             if (proxyAuthToken) {
+-                envVars.push(`CLOUDSDK_PROXY_USERNAME=srt`);
++                envVars.push(`CLOUDSDK_PROXY_USERNAME=${proxyAuthUsername(networkContext)}`);
+                 envVars.push(`CLOUDSDK_PROXY_PASSWORD=${proxyAuthToken}`);
+             }
+         }
+diff --git a/dist/sandbox/socks-proxy.d.ts b/dist/sandbox/socks-proxy.d.ts
+index 6328c83..f028a64 100644
+--- a/dist/sandbox/socks-proxy.d.ts
++++ b/dist/sandbox/socks-proxy.d.ts
+@@ -2,6 +2,12 @@ import type { Socket } from 'net';
+ import type { ResolvedParentProxy } from './parent-proxy.js';
+ export interface SocksProxyServerOptions {
+     filter(port: number, host: string): Promise<boolean> | boolean;
++    /**
++     * Gate tunnels whose cleartext identification exchange is SSH. Receives
++     * the network context carried by the authenticated SOCKS username
++     * (undefined when it carried none).
++     */
++    filterSsh?(port: number, host: string, context?: string): Promise<boolean> | boolean;
+     /**
+      * Optional upstream HTTP proxy. When present, SOCKS CONNECT requests are
+      * tunnelled through the parent's HTTP CONNECT instead of dialing directly.
+@@ -10,8 +16,10 @@ export interface SocksProxyServerOptions {
+     parentProxy?: ResolvedParentProxy;
+     /**
+      * Per-session token (same value as the HTTP proxy's). When set, the
+-     * server requires SOCKS5 username/password auth and only accepts
+-     * user "srt" with this token as the password.
++     * server requires SOCKS5 username/password auth: the password must be this
++     * token, and the username must be `srt` or `srt.<base64url network
++     * context>` — the username carries the launch's network context for
++     * proxied-connection attribution, never the secret.
+      */
+     proxyAuthToken?: string;
+ }
+diff --git a/dist/sandbox/socks-proxy.js b/dist/sandbox/socks-proxy.js
+index 98b9873..cab81d5 100644
+--- a/dist/sandbox/socks-proxy.js
++++ b/dist/sandbox/socks-proxy.js
+@@ -1,11 +1,16 @@
+ import { createServer } from '@pondwader/socks5-server';
+ import { logForDebugging } from '../utils/debug.js';
+ import { connectViaParentProxy, dialDirect, isValidHost, selectParentProxyUrl, shouldBypassParentProxy, } from './parent-proxy.js';
++import { authorizeSshTunnel } from './http-proxy.js';
++import { isProxyAuthUsername, proxyAuthNetworkContext } from './sandbox-utils.js';
+ export function createSocksProxyServer(options) {
+     const socksServer = createServer();
+     if (options.proxyAuthToken) {
+         socksServer.setAuthHandler((conn, accept, deny) => {
+-            if (conn.username === 'srt' && conn.password === options.proxyAuthToken) {
++            // The password is the secret; the username is `srt` or
++            // `srt.<base64url network context>`, carrying which launch this
++            // connection belongs to.
++            if (isProxyAuthUsername(conn.username) && conn.password === options.proxyAuthToken) {
+                 accept();
+             }
+             else {
+@@ -67,14 +72,36 @@ export function createSocksProxyServer(options) {
+             ? connectViaParentProxy(parentUrl, host, port)
+             : dialDirect(host, port);
+         open
+-            .then(upstream => {
++            .then(async upstream => {
+             upstreamRef = upstream;
+             upstream.on('error', () => conn.socket.destroy());
+             if (clientGone) {
+                 upstream.destroy();
+                 return;
+             }
++            conn.socket.pause();
+             sendStatus('REQUEST_GRANTED');
++            const protocol = await authorizeSshTunnel({
++                client: conn.socket,
++                upstream,
++                filterSsh: options.filterSsh,
++                host,
++                port,
++                // Which launch this SOCKS connection belongs to, from the
++                // authenticated username (`conn.username` is set by the auth
++                // handler when a token is configured).
++                context: proxyAuthNetworkContext(conn.username),
++            });
++            if (!protocol.allowed) {
++                logForDebugging(`SSH connection blocked to ${host}:${port}`, { level: 'error' });
++                upstream.destroy();
++                conn.socket.destroy();
++                return;
++            }
++            if (protocol.clientHead.length)
++                upstream.write(protocol.clientHead);
++            if (protocol.upstreamHead.length)
++                conn.socket.write(protocol.upstreamHead);
+             upstream.pipe(conn.socket);
+             conn.socket.pipe(upstream);
+             upstream.on('close', () => conn.socket.destroy());
