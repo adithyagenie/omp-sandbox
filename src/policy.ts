@@ -3,6 +3,7 @@ import type { PathRuleScope, SandboxConfig } from "./config.ts";
 import { existsSync, lstatSync, readlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, parse, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export function extractDomainsFromCommand(command: string): string[] {
   const domains = new Set<string>();
@@ -491,6 +492,13 @@ export function classifyToolPath(raw: string): ClassifiedPath {
       const url = new URL(raw);
       if (url.protocol === "ssh:") return { kind: "ssh", host: url.hostname };
       if (url.protocol === "http:" || url.protocol === "https:") return { kind: "url", domain: url.hostname };
+      if (url.protocol === "file:") {
+        try {
+          return { kind: "fs", path: fileURLToPath(url) };
+        } catch {
+          return { kind: "fs", path: raw };
+        }
+      }
       return { kind: "internal" };
     } catch {
       return { kind: "internal" };
