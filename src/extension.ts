@@ -1,6 +1,6 @@
 import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { isToolCallEventType } from "@oh-my-pi/pi-coding-agent";
 import { SandboxManager, type SandboxRuntimeConfig } from "@carderne/sandbox-runtime";
+import { randomBytes } from "node:crypto";
 import {
   addDomainToConfig,
   addReadPathToConfig,
@@ -37,24 +37,21 @@ import {
   createLaunchTemplate,
   ensureSandboxTmpdir,
   getExtensionHandlerTimeoutBridge,
+  sandboxShellPath,
   initializeSandboxOnce,
   outputStats,
   resetSandbox,
   runSandboxedShell,
-  sandboxShellName,
   toToolResult,
   updateSandboxConfig,
   withExtensionHandlerTimeoutBridge,
+  type LaunchTemplate,
   type RuntimeSharedState,
 } from "./sandbox-runtime.ts";
 import {
-  clearLaunchWindows,
-  closeLaunchWindow,
   getLaunchGuardState,
   installLaunchSandboxGuard,
-  LAUNCH_WINDOW_TTL_MS,
-  openLaunchWindow,
-  setLaunchTemplate,
+  withLaunchWindow,
   type LaunchGuardState,
 } from "./launch-guard.ts";
 import {
@@ -71,23 +68,24 @@ import {
   type PermissionRequestDetails,
 } from "./ui.ts";
 
+interface WrappedDaemon {
+  phase: "starting" | "running";
+  cleanupToken?: string;
+}
+
 interface ActiveSshContext {
   ctx: ExtensionContext;
   tool: string;
   request: string;
   deferredHosts: Set<string>;
-  openedAt: number;
-  cleanupSandbox?: true;
 }
 
 interface SharedSandboxState extends RuntimeSharedState, PromptSharedState {
   enabled: boolean;
   sessionCount: number;
   launchGuard: LaunchGuardState;
-  wrappedDaemons: Set<string>;
+  wrappedDaemons: Map<string, WrappedDaemon>;
   sshContexts: Map<string, ActiveSshContext>;
-  sshContextSequence: number;
-  shellQueues: Map<string, Promise<void>>;
   migrationDone: boolean;
 }
 
@@ -98,7 +96,19 @@ interface GlobalWithSharedSandbox {
 
 function getSharedState(): SharedSandboxState {
   const global = globalThis as typeof globalThis & GlobalWithSharedSandbox;
-  if (global[SHARED_KEY]) return global[SHARED_KEY];
+  const existing = global[SHARED_KEY];
+  if (existing) {
+    if (existing.wrappedDaemons instanceof Set) {
+      existing.wrappedDaemons = new Map([...existing.wrappedDaemons].map((name) => [name, { phase: "running" as const }]));
+    } else {
+      for (const [name, value] of existing.wrappedDaemons) {
+        if (typeof value === "string" || value === undefined) {
+          existing.wrappedDaemons.set(name, { phase: "running", cleanupToken: value });
+        }
+      }
+    }
+    return existing;
+  }
   const shared: SharedSandboxState = {
     enabled: false,
     managerInitialized: false,
@@ -107,35 +117,14 @@ function getSharedState(): SharedSandboxState {
     session: { domains: [], read: [], write: [], ssh: [] },
     launchGuard: getLaunchGuardState(),
     sshContexts: new Map(),
-    shellQueues: new Map(),
-    sshContextSequence: 0,
     runtimeRawConfig: { globalSection: {}, projectSection: {} },
     mainUi: null,
     promptQueue: Promise.resolve(),
-    wrappedDaemons: new Set(),
+    wrappedDaemons: new Map(),
     migrationDone: false,
   };
   global[SHARED_KEY] = shared;
   return shared;
-}
-
-async function withShellQueue<TResult>(
-  shared: SharedSandboxState,
-  cwd: string,
-  run: () => Promise<TResult>,
-): Promise<TResult> {
-  const key = canonicalizePath(cwd);
-  const previous = shared.shellQueues.get(key) ?? Promise.resolve();
-  const { promise: gate, resolve: release } = Promise.withResolvers<void>();
-  const tail = previous.then(() => gate);
-  shared.shellQueues.set(key, tail);
-  await previous;
-  try {
-    return await run();
-  } finally {
-    release();
-    if (shared.shellQueues.get(key) === tail) shared.shellQueues.delete(key);
-  }
 }
 
 function filesystemConfig(
@@ -285,18 +274,16 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
     return undefined;
   }
 
-  async function authorizeRuntimeSsh(host: string): Promise<boolean> {
-    const now = Date.now();
-    for (const [id, active] of shared.sshContexts) {
-      if (now - active.openedAt > LAUNCH_WINDOW_TTL_MS) shared.sshContexts.delete(id);
-    }
-    if (shared.sshContexts.size !== 1) {
-      shared.launchGuard.note(
-        `[pi-sandbox-omp] denied runtime SSH to ${host}: expected one active sandbox context, found ${shared.sshContexts.size}`,
-      );
+  async function authorizeRuntimeSsh(host: string, networkContext: string | undefined): Promise<boolean> {
+    if (!networkContext) {
+      shared.launchGuard.note(`[pi-sandbox-omp] denied runtime SSH to ${host}: launch context is missing`);
       return false;
     }
-    const active = shared.sshContexts.values().next().value as ActiveSshContext;
+    const active = shared.sshContexts.get(networkContext);
+    if (!active) {
+      shared.launchGuard.note(`[pi-sandbox-omp] denied runtime SSH to ${host}: launch context is no longer active`);
+      return false;
+    }
     const loaded = load(active.ctx.cwd);
     const decision = decideHost(ruleLayersForTool(loaded, active.tool, shared.session).ssh, host);
     if (decision === "allow") return true;
@@ -314,19 +301,19 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
   }
 
   async function withRuntimeSshContext<TResult>(
-    id: string,
     ctx: ExtensionContext,
     tool: string,
     request: string,
-    run: () => Promise<TResult>,
+    run: (networkContext: string) => Promise<TResult>,
   ): Promise<TResult> {
-    const active: ActiveSshContext = { ctx, tool, request, openedAt: Date.now(), deferredHosts: new Set() };
-    shared.sshContexts.set(id, active);
+    const networkContext = randomBytes(16).toString("hex");
+    const active: ActiveSshContext = { ctx, tool, request, deferredHosts: new Set() };
+    shared.sshContexts.set(networkContext, active);
     try {
-      return await run();
+      return await run(networkContext);
     } finally {
-      if (shared.sshContexts.get(id) === active) {
-        shared.sshContexts.delete(id);
+      if (shared.sshContexts.get(networkContext) === active) {
+        shared.sshContexts.delete(networkContext);
         await promptDeferredSshHosts(active);
       }
     }
@@ -349,14 +336,6 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
     return undefined;
   }
 
-  async function prepareLaunch(
-    scope: "device" | "eval",
-    raw: { globalSection: SandboxConfig; projectSection: SandboxConfig },
-  ): Promise<string> {
-    const template = await createLaunchTemplate(shared, scope, raw);
-    setLaunchTemplate(shared.launchGuard, scope, template);
-    return template;
-  }
 
   function installGuard(): void {
     shared.launchGuard.bashPath = bashShellPath();
@@ -378,18 +357,15 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       refreshMainUi(ctx);
       const cwd = params.cwd ?? ctx.cwd;
-      const execute = async (): Promise<AgentToolResult<unknown>> =>
-        withRuntimeSshContext(_toolCallId, ctx, "bash", `bash: ${params.command}`, async () =>
+      const run = (): Promise<AgentToolResult<unknown>> =>
+        withRuntimeSshContext(ctx, "bash", `bash: ${params.command}`, async (networkContext) =>
           toToolResult(await runSandboxedShell(params.command, cwd, bashShellPath(), {
             signal,
             timeout: params.timeout,
             wrap: shared.enabled && shared.managerInitialized,
             customConfig: filesystemConfig(load(cwd), "bash", shared.session),
+            networkContext,
           })));
-      const run = (): Promise<AgentToolResult<unknown>> =>
-        shared.enabled && shared.managerInitialized
-          ? withShellQueue(shared, cwd, execute)
-          : execute();
       let result: AgentToolResult<unknown>;
       try {
         result = await run();
@@ -420,6 +396,83 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
     },
   });
 
+  pi.registerTool({
+    name: "eval",
+    label: "eval (sandboxed)",
+    description: "Run code in a persistent Python or JavaScript kernel with sandboxed child-process launches.",
+    parameters: z.object({
+      language: z.enum(["py", "js"]),
+      code: z.string(),
+      title: z.string().nullable().optional(),
+      timeout: z.number().nullable().optional(),
+      reset: z.boolean().nullable().optional(),
+    }),
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      refreshMainUi(ctx);
+      if (!ctx.invokeTool) return errorResult("Sandbox: native eval delegation requires omp 18.x with ExtensionContext.invokeTool.");
+      if (!shared.enabled || !shared.managerInitialized) return ctx.invokeTool(params, { signal, onUpdate });
+      const loaded = load(ctx.cwd);
+      const request = `eval: ${JSON.stringify({ language: params.language, title: params.title })}`;
+      return withRuntimeSshContext(ctx, "eval", request, async (networkContext) => {
+        let launch: LaunchTemplate;
+        try {
+          launch = await createLaunchTemplate(shared, "eval", networkContext, loaded);
+        } catch (error) {
+          return errorResult(`Sandbox: failed to prepare eval sandbox: ${error instanceof Error ? error.message : error}. Retry the tool call.`);
+        }
+        try {
+          return await withLaunchWindow(
+            shared.launchGuard,
+            "eval",
+            launch.template,
+            () => ctx.invokeTool(params, { signal, onUpdate }),
+          );
+        } finally {
+          if (launch.cleanupToken) cleanupAfterCommand(launch.cleanupToken);
+        }
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "write",
+    label: "write",
+    description: "Create or overwrite a file or invoke a writable internal device.",
+    parameters: z.object({
+      path: z.string(),
+      content: z.string(),
+    }),
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      refreshMainUi(ctx);
+      if (!ctx.invokeTool) return errorResult("Sandbox: native write delegation requires omp 18.x with ExtensionContext.invokeTool.");
+      if (!shared.enabled || !shared.managerInitialized || !params.path.startsWith("xd://")) {
+        return ctx.invokeTool(params, { signal, onUpdate });
+      }
+      const loaded = load(ctx.cwd);
+      const device = params.path.slice(5).split("/")[0];
+      const devices = new Set(loaded.config.sandboxedDevices ?? DEFAULT_SANDBOXED_DEVICES);
+      if (!device || !devices.has(device)) return ctx.invokeTool(params, { signal, onUpdate });
+      return withRuntimeSshContext(ctx, "write", `write device: ${params.path}`, async (networkContext) => {
+        let launch: LaunchTemplate;
+        try {
+          launch = await createLaunchTemplate(shared, "device", networkContext, loaded);
+        } catch (error) {
+          return errorResult(`Sandbox: failed to prepare the OS sandbox for xd://${device} launches: ${error instanceof Error ? error.message : error}. Retry the tool call.`);
+        }
+        try {
+          return await withLaunchWindow(
+            shared.launchGuard,
+            "device",
+            launch.template,
+            () => ctx.invokeTool(params, { signal, onUpdate }),
+          );
+        } finally {
+          if (launch.cleanupToken) cleanupAfterCommand(launch.cleanupToken);
+        }
+      });
+    },
+  });
+
   const hubParameters = z.object({
     op: z.enum(["send", "wait", "inbox", "list", "jobs", "cancel", "start", "ps", "logs", "stop", "restart", "describe"]),
     to: z.string().optional(), message: z.string().optional(), replyTo: z.string().optional(), await: z.boolean().optional(),
@@ -446,43 +499,72 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
         return errorResult(`Sandbox: refusing to restart daemon "${params.name}": it was not started under the sandbox by this process (its broker-stored launch spec is unverified). Use hub op:"stop" then op:"start" to relaunch it sandboxed.`);
       }
       if (params.op === "stop") {
-        const wrapped = params.name ? shared.wrappedDaemons.has(params.name) : false;
+        if ([...shared.wrappedDaemons.values()].some((daemon) => daemon.phase === "starting")) {
+          return errorResult("Sandbox: cannot stop daemons while a sandboxed hub start is still in progress. Retry after the start completes.");
+        }
+        const daemons = params.name
+          ? [shared.wrappedDaemons.get(params.name)]
+          : [...shared.wrappedDaemons.values()];
         const result = await ctx.invokeTool(params, { signal, onUpdate });
         if (params.name) shared.wrappedDaemons.delete(params.name);
-        if (wrapped) cleanupAfterCommand();
+        else shared.wrappedDaemons.clear();
+        for (const daemon of daemons) {
+          if (daemon?.cleanupToken) cleanupAfterCommand(daemon.cleanupToken);
+        }
         return result;
       }
       if (params.op !== "start" || !params.application) return ctx.invokeTool(params, { signal, onUpdate });
-      const loaded = load(ctx.cwd);
-      const argv = [params.application, ...(params.args ?? [])];
-      const gate = await enforceNetworkAndSshGate(shellQuoteJoin(argv), ctx, "hub");
-      if (gate) return errorResult(gate.reason);
-      let wrapped: string;
+      if (!params.name) {
+        return errorResult("Sandbox: hub start requires an explicit name so its sandbox resources can be released safely on stop.");
+      }
+      if (shared.wrappedDaemons.has(params.name)) {
+        return errorResult(`Sandbox: daemon "${params.name}" already owns a sandbox launch. Stop it before starting a replacement.`);
+      }
+      const daemon: WrappedDaemon = { phase: "starting" };
+      shared.wrappedDaemons.set(params.name, daemon);
       try {
-        wrapped = await SandboxManager.wrapWithSandbox(
-          shellQuoteJoin(argv),
-          sandboxShellName(),
-          filesystemConfig(loaded, "hub", shared.session),
-        );
-      } catch (error) {
-        return errorResult(`Sandbox: failed to wrap hub launch in the OS sandbox: ${error instanceof Error ? error.message : error}`);
+        const loaded = load(ctx.cwd);
+        const argv = [params.application, ...(params.args ?? [])];
+        const gate = await enforceNetworkAndSshGate(shellQuoteJoin(argv), ctx, "hub");
+        if (gate) return errorResult(gate.reason);
+        const ui = ctx.hasUI ? ctx.ui : shared.mainUi;
+        if (ui && params.ready?.port !== undefined) {
+          ui.notify(`Sandbox network isolation is on: ready.port ${params.ready.port} cannot accept host connections; use ready.log.`, "warning");
+        }
+        if (ui && (params.detached || params.persist)) {
+          ui.notify("Sandboxed daemons are tied to the broker lifetime despite persist/detached.", "warning");
+        }
+        return await withRuntimeSshContext(ctx, "hub", `hub start: ${shellQuoteJoin(argv)}`, async (networkContext) => {
+          let lease: { command: string; cleanupToken?: string };
+          try {
+            lease = await SandboxManager.wrapWithSandboxLease(
+              shellQuoteJoin(argv),
+              sandboxShellPath(),
+              filesystemConfig(loaded, "hub", shared.session),
+              undefined,
+              networkContext,
+            );
+          } catch (error) {
+            return errorResult(`Sandbox: failed to wrap hub launch in the OS sandbox: ${error instanceof Error ? error.message : error}`);
+          }
+          try {
+            const result = await ctx.invokeTool(
+              { ...params, application: bashShellPath(), args: ["-c", lease.command] },
+              { signal, onUpdate },
+            );
+            daemon.phase = "running";
+            daemon.cleanupToken = lease.cleanupToken;
+            return result;
+          } catch (error) {
+            if (lease.cleanupToken) cleanupAfterCommand(lease.cleanupToken);
+            throw error;
+          }
+        });
+      } finally {
+        if (daemon.phase === "starting" && shared.wrappedDaemons.get(params.name) === daemon) {
+          shared.wrappedDaemons.delete(params.name);
+        }
       }
-      const ui = ctx.hasUI ? ctx.ui : shared.mainUi;
-      if (ui && params.ready?.port !== undefined) {
-        ui.notify(`Sandbox network isolation is on: ready.port ${params.ready.port} cannot accept host connections; use ready.log.`, "warning");
-      }
-      if (ui && (params.detached || params.persist)) {
-        ui.notify("Sandboxed daemons are tied to the broker lifetime despite persist/detached.", "warning");
-      }
-      const result = await withRuntimeSshContext(
-        _toolCallId,
-        ctx,
-        "hub",
-        `hub start: ${shellQuoteJoin(argv)}`,
-        () => ctx.invokeTool({ ...params, application: bashShellPath(), args: ["-c", wrapped] }, { signal, onUpdate }),
-      );
-      if (params.name) shared.wrappedDaemons.add(params.name);
-      return result;
     },
   });
 
@@ -531,15 +613,14 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
       const output = `Blocked: ${gate.reason}`;
       return { result: { output, exitCode: 1, cancelled: false, truncated: false, ...outputStats(output) } };
     }
-    const id = `user-bash:${++shared.sshContextSequence}`;
-    return withShellQueue(shared, ctx.cwd, () =>
-      withRuntimeSshContext(id, ctx, "bash", `bash: ${event.command}`, async () => {
-        const run = await runSandboxedShell(event.command, ctx.cwd, bashShellPath(), {
-          wrap: true,
-          customConfig: filesystemConfig(load(ctx.cwd), "bash", shared.session),
-        });
-        return { result: { output: run.output, exitCode: run.exitCode ?? 0, cancelled: false, truncated: false, ...outputStats(run.output) } };
-      }));
+    return withRuntimeSshContext(ctx, "bash", `bash: ${event.command}`, async (networkContext) => {
+      const run = await runSandboxedShell(event.command, ctx.cwd, bashShellPath(), {
+        wrap: true,
+        customConfig: filesystemConfig(load(ctx.cwd), "bash", shared.session),
+        networkContext,
+      });
+      return { result: { output: run.output, exitCode: run.exitCode ?? 0, cancelled: false, truncated: false, ...outputStats(run.output) } };
+    });
   }));
 
   pi.on("tool_call", withExtensionHandlerTimeoutBridge(timeoutBridge, async (event, ctx) => {
@@ -550,8 +631,8 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
     const input = event.input as Record<string, unknown>;
     const tool = event.toolName;
 
-    if (shared.managerInitialized && isToolCallEventType("bash", event)) {
-      const gate = await enforceNetworkAndSshGate(event.input.command, ctx, "bash");
+    if (shared.managerInitialized && tool === "bash" && typeof input.command === "string") {
+      const gate = await enforceNetworkAndSshGate(input.command, ctx, "bash");
       if (gate) return gate;
     }
 
@@ -618,52 +699,8 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
       }
     }
 
-    if (tool === "eval") {
-      let prepared = false;
-      try {
-        await prepareLaunch("eval", loaded);
-        prepared = true;
-        openLaunchWindow(shared.launchGuard, event.toolCallId, "eval");
-        const request = `eval: ${JSON.stringify({ language: input.language, title: input.title })}`;
-        shared.sshContexts.set(event.toolCallId, {
-          ctx, tool, request, openedAt: Date.now(), deferredHosts: new Set(), cleanupSandbox: true,
-        });
-      } catch (error) {
-        if (prepared) cleanupAfterCommand();
-        return { block: true, reason: `Sandbox: failed to prepare eval sandbox: ${error instanceof Error ? error.message : error}. Retry the tool call.` };
-      }
-    }
 
-    if (shared.managerInitialized && isToolCallEventType("write", event) && typeof event.input.path === "string" && event.input.path.startsWith("xd://")) {
-      const device = event.input.path.slice(5).split("/")[0];
-      const devices = new Set(loaded.config.sandboxedDevices ?? DEFAULT_SANDBOXED_DEVICES);
-      if (device && devices.has(device)) {
-        let prepared = false;
-        try {
-          await prepareLaunch("device", loaded);
-          prepared = true;
-          openLaunchWindow(shared.launchGuard, event.toolCallId, "device");
-          const request = `write device: ${event.input.path}`;
-          shared.sshContexts.set(event.toolCallId, {
-            ctx, tool, request, openedAt: Date.now(), deferredHosts: new Set(), cleanupSandbox: true,
-          });
-        } catch (error) {
-          if (prepared) cleanupAfterCommand();
-          return { block: true, reason: `Sandbox: failed to prepare the OS sandbox for xd://${device} launches: ${error instanceof Error ? error.message : error}. Retry the tool call.` };
-        }
-      }
-    }
   }));
-
-  const closeWindow = async (event: { toolCallId: string }): Promise<void> => {
-    closeLaunchWindow(shared.launchGuard, event.toolCallId);
-    const active = shared.sshContexts.get(event.toolCallId);
-    shared.sshContexts.delete(event.toolCallId);
-    if (active?.cleanupSandbox) cleanupAfterCommand();
-    if (active) await promptDeferredSshHosts(active);
-  };
-  pi.on("tool_result", withExtensionHandlerTimeoutBridge(timeoutBridge, async (event) => closeWindow(event)));
-  pi.on("tool_execution_end" as never, withExtensionHandlerTimeoutBridge(timeoutBridge, async (event: { toolCallId: string }) => closeWindow(event)) as never);
 
   pi.on("session_start", async (_event, ctx) => {
     refreshMainUi(ctx);
@@ -702,7 +739,6 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
       shared.sshContexts.clear();
       shared.managerInitialized = false;
       shared.initPromise = null;
-      clearLaunchWindows(shared.launchGuard);
     }
   });
 
@@ -739,7 +775,6 @@ export default function sandboxExtension(pi: ExtensionAPI): void {
       shared.managerInitialized = false;
       shared.initPromise = null;
       shared.sshContexts.clear();
-      clearLaunchWindows(shared.launchGuard);
       ctx.ui.setStatus("sandbox", "");
       ctx.ui.notify("Sandbox disabled", "info");
     },

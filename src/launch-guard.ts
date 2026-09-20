@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { basename } from "node:path";
 import { shellQuoteJoin } from "./policy.ts";
 
@@ -29,12 +30,12 @@ export interface LaunchWindow {
   openedAt: number;
   scope: LaunchScope;
   template: string;
+  closed: boolean;
 }
 
 export interface LaunchGuardState {
   installed: boolean;
-  activeCalls: Map<string, LaunchWindow>;
-  templates: Map<LaunchScope, string>;
+  storage: AsyncLocalStorage<LaunchWindow>;
   bashPath: string;
   isEnabled: () => boolean;
   note: (message: string) => void;
@@ -50,11 +51,13 @@ interface GlobalWithLaunchGuard {
 export function getLaunchGuardState(): LaunchGuardState {
   const global = globalThis as typeof globalThis & GlobalWithLaunchGuard;
   const existing = global[LAUNCH_GUARD_KEY];
-  if (existing) return existing;
+  if (existing) {
+    existing.storage ??= new AsyncLocalStorage<LaunchWindow>();
+    return existing;
+  }
   const state: LaunchGuardState = {
     installed: false,
-    activeCalls: new Map(),
-    templates: new Map(),
+    storage: new AsyncLocalStorage<LaunchWindow>(),
     bashPath: "/bin/bash",
     isEnabled: () => false,
     note: () => {},
@@ -63,40 +66,34 @@ export function getLaunchGuardState(): LaunchGuardState {
   return state;
 }
 
-export function setLaunchTemplate(state: LaunchGuardState, scope: LaunchScope, template: string): void {
-  state.templates.set(scope, template);
-}
-
-export function openLaunchWindow(state: LaunchGuardState, toolCallId: string, scope: LaunchScope): void {
-  if (launchWindowActive(state)) {
-    throw new Error("[pi-sandbox-omp] another sandboxed launch is still active; retry the tool call");
-  }
-  const template = state.templates.get(scope);
-  if (!template) {
-    throw new Error("[pi-sandbox-omp] sandboxed launch requested but the bwrap template is not ready; retry the tool call");
-  }
-  state.activeCalls.set(toolCallId, { openedAt: Date.now(), scope, template });
-}
-
-export function closeLaunchWindow(state: LaunchGuardState, toolCallId: string): void {
-  state.activeCalls.delete(toolCallId);
-}
-
-export function clearLaunchWindows(state: LaunchGuardState): void {
-  state.activeCalls.clear();
+export async function withLaunchWindow<TResult>(
+  state: LaunchGuardState,
+  scope: LaunchScope,
+  template: string,
+  run: () => Promise<TResult>,
+): Promise<TResult> {
+  const window: LaunchWindow = {
+    openedAt: Date.now(),
+    scope,
+    template,
+    closed: false,
+  };
+  return state.storage.run(window, async () => {
+    try {
+      return await run();
+    } finally {
+      window.closed = true;
+    }
+  });
 }
 
 export function launchWindowActive(state: LaunchGuardState): LaunchWindow | null {
-  const now = Date.now();
-  let active: LaunchWindow | null = null;
-  for (const [id, window] of state.activeCalls) {
-    if (now - window.openedAt > LAUNCH_WINDOW_TTL_MS) {
-      state.activeCalls.delete(id);
-    } else {
-      active = window;
-    }
-  }
-  return active;
+  const window = state.storage.getStore();
+  if (!window || window.closed) return null;
+  if (Date.now() - window.openedAt <= LAUNCH_WINDOW_TTL_MS) return window;
+  window.closed = true;
+  state.note(`[pi-sandbox-omp] expired stale ${window.scope} sandbox launch context`);
+  return null;
 }
 
 export function isInfraSpawn(executable: string, argv: string[]): boolean {

@@ -80,8 +80,8 @@ export function bashShellPath(): string {
   return cachedBashPath;
 }
 
-export function sandboxShellName(): string {
-  return basename(bashShellPath());
+export function sandboxShellPath(): string {
+  return bashShellPath();
 }
 
 export function ensureSandboxTmpdir(): void {
@@ -101,14 +101,15 @@ interface RuntimeNetworkRequest {
   host: string;
   port: number | undefined;
   protocol?: "ssh";
+  context?: string;
 }
 
 export function createNetworkAskCallback(
   allowedDomains: string[],
-  authorizeSsh?: (host: string) => Promise<boolean>,
+  authorizeSsh?: (host: string, context: string | undefined) => Promise<boolean>,
 ): SandboxAskCallback {
-  const callback = async ({ host, protocol }: RuntimeNetworkRequest): Promise<boolean> => {
-    if (protocol === "ssh") return authorizeSsh ? authorizeSsh(host) : false;
+  const callback = async ({ host, protocol, context }: RuntimeNetworkRequest): Promise<boolean> => {
+    if (protocol === "ssh") return authorizeSsh ? authorizeSsh(host, context) : false;
     return domainIsAllowed(host, allowedDomains);
   };
   return callback as SandboxAskCallback;
@@ -140,7 +141,7 @@ export async function initializeSandboxOnce(
   shared: RuntimeSharedState,
   config: SandboxConfig,
   session: SessionAllowances,
-  authorizeSsh?: (host: string) => Promise<boolean>,
+  authorizeSsh?: (host: string, context: string | undefined) => Promise<boolean>,
 ): Promise<void> {
   if (shared.managerInitialized) return;
   if (!shared.initPromise) {
@@ -170,9 +171,9 @@ export async function resetSandbox(): Promise<void> {
   }
 }
 
-export function cleanupAfterCommand(): void {
+export function cleanupAfterCommand(cleanupToken?: string): void {
   try {
-    SandboxManager.cleanupAfterCommand();
+    SandboxManager.cleanupAfterCommand(cleanupToken);
   } catch {
     // reset() and process-exit hooks are safety nets.
   }
@@ -188,13 +189,21 @@ export async function runSandboxedShell(
     env?: Record<string, string>;
     wrap?: boolean;
     customConfig?: SandboxRuntimeConfig;
+    networkContext?: string;
   },
 ): Promise<ShellRunResult> {
   if (!existsSync(cwd)) throw new Error(`Working directory does not exist: ${cwd}`);
   const shouldWrap = opts.wrap ?? true;
-  const wrapped = shouldWrap
-    ? await SandboxManager.wrapWithSandbox(command, basename(shellPath), opts.customConfig)
-    : command;
+  const lease = shouldWrap
+    ? await SandboxManager.wrapWithSandboxLease(
+      command,
+      shellPath,
+      opts.customConfig,
+      undefined,
+      opts.networkContext,
+    )
+    : { command };
+  const wrapped = lease.command;
   const { promise, resolve: resolvePromise, reject } = Promise.withResolvers<ShellRunResult>();
   let child: ChildProcess;
   try {
@@ -205,7 +214,7 @@ export async function runSandboxedShell(
       stdio: ["ignore", "pipe", "pipe"],
     });
   } catch (error) {
-    if (shouldWrap) cleanupAfterCommand();
+    if (shouldWrap) cleanupAfterCommand(lease.cleanupToken);
     throw error;
   }
   let output = "";
@@ -250,7 +259,7 @@ export async function runSandboxedShell(
     else resolvePromise({ exitCode: code, output });
   });
   if (!shouldWrap) return promise;
-  return promise.finally(cleanupAfterCommand);
+  return promise.finally(() => cleanupAfterCommand(lease.cleanupToken));
 }
 
 export function toToolResult(run: ShellRunResult): AgentToolResult<unknown> {
@@ -286,14 +295,23 @@ function filesystemOverride(
   } as SandboxRuntimeConfig;
 }
 
-export function createLaunchTemplate(
+export interface LaunchTemplate {
+  template: string;
+  cleanupToken?: string;
+}
+
+export async function createLaunchTemplate(
   shared: RuntimeSharedState,
   scope: "device" | "eval",
+  networkContext: string,
   raw = shared.runtimeRawConfig,
-): Promise<string> {
-  return SandboxManager.wrapWithSandbox(
+): Promise<LaunchTemplate> {
+  const lease = await SandboxManager.wrapWithSandboxLease(
     `exec ${shellQuoteArg(bashShellPath())} -c "$${LAUNCH_CMD_VAR}"`,
-    sandboxShellName(),
+    sandboxShellPath(),
     filesystemOverride(shared, raw, scope),
+    undefined,
+    networkContext,
   );
+  return { template: lease.command, cleanupToken: lease.cleanupToken };
 }
