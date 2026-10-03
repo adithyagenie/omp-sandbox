@@ -1,11 +1,13 @@
 # pi-sandbox-omp
 
-OS-level process sandboxing and policy gates for Oh My Pi tools.
 
-> [!WARNING]
-> This sandbox is vibe-coded. Expect it to break. Treat it as experimental,
-> review the source and effective permissions, and do not rely on it as a
-> hardened security boundary.
+> [!NOTE]
+> This project is no longer maintained.
+>
+> Check out [clanker-cage](https://github.com/adithyagenie/clanker-cage), a more harness-agnostic approach to sandboxing.
+> omp specific plugin for clanker-cage is [here](https://github.com/adithyagenie/clanker-cage-omp).
+
+OS-level process sandboxing and policy gates for Oh My Pi tools.
 
 ## Features
 
@@ -139,3 +141,8 @@ Persistent grants update generic allow lists. Per-tool overrides are hand-edited
 The launch guard never wraps omp worker/broker processes, `process.execPath`, sandbox infrastructure helpers, or IPC spawns. Sandboxed daemons remain tied to the broker lifetime despite `persist` or `detached`, because bubblewrap uses parent-death containment. A restricted daemon listening on `ready.port` is inside the sandbox network namespace and cannot accept host connections; use log readiness.
 
 Linux behavior is functionally verified. The macOS `sandbox-exec` path follows sandbox-runtime's supported API but is not exercised by this repository's Linux verification workflow.
+
+> [!WARNING]
+> This sandbox is vibe-coded. Expect it to break. Treat it as experimental,
+> review the source and effective permissions, and do not rely on it as a
+> hardened security boundary.
